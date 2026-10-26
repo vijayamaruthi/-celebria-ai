@@ -1,0 +1,6 @@
+{
+  "name": "Celebria AI — Intelligent Celebration Planner",
+  "description": "Your vision. Your budget. Your perfect celebration. GenAI-powered celebration and event planning workspace for weddings, birthdays, and community events.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
