@@ -18,7 +18,7 @@ const __dirname = path.dirname(__filename);
 
 const app = express();
 // Port 3000 is required by the environment where Nginx reverse proxies 8080 -> 3000
-const PORT = 3000;
+const PORT = Number(process.env.PORT) || 3000;
 
 app.use(express.json({ limit: '10mb' }));
 

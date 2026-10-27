@@ -1,45 +1,34 @@
-# Multi-stage production build for Celebria AI
+# Stage 1: Build and test
 FROM node:20-alpine AS builder
 
 WORKDIR /app
 
-# Copy package manifests
-COPY package.json package-lock.json* ./
+COPY package.json package-lock.json ./
+RUN npm ci
 
-# Install dependencies
-RUN npm install
-
-# Copy source files
 COPY . .
 
-# Run tests to guarantee build integrity
 RUN npm test
-
-# Build production client bundle
 RUN npm run build
 
-# Stage 2: Minimal runtime image
+# Stage 2: Production runtime
 FROM node:20-alpine AS runner
 
 WORKDIR /app
 
 ENV NODE_ENV=production
-ENV PORT=3000
 
-# Copy package manifests and production dependencies
-COPY package.json ./
-RUN npm install --omit=dev
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev
 
-# Copy compiled frontend and server
+RUN npm install --no-save tsx
+
 COPY --from=builder /app/dist ./dist
 COPY --from=builder /app/server.ts ./server.ts
 COPY --from=builder /app/src/server ./src/server
 COPY --from=builder /app/src/types ./src/types
 COPY --from=builder /app/src/utils ./src/utils
 
-# Install tsx globally or locally to run TypeScript server
-RUN npm install -g tsx
-
 EXPOSE 3000
 
-CMD ["tsx", "server.ts"]
+CMD ["./node_modules/.bin/tsx", "server.ts"]
