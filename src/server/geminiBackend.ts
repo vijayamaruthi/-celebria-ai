@@ -141,7 +141,7 @@ Ensure numeric budget allocations sum to approximately the total budget. Ensure 
 
   try {
     const response = await ai.models.generateContent({
-      model: 'gemini-2.5-flash',
+      model: 'gemini-3.8-flash',
       contents: prompt,
       config: {
         responseMimeType: 'application/json',
@@ -157,13 +157,13 @@ Ensure numeric budget allocations sum to approximately the total budget. Ensure 
         ...parsed,
         eventId: event.id,
         isFallback: false,
-        modelUsed: 'Gemini 2.5 Flash',
+        modelUsed: 'Gemini 3.8 Flash',
         generatedAt: new Date().toISOString(),
       },
-      model: 'Gemini 2.5 Flash',
+      model: 'Gemini 3.8 Flash',
     };
   } catch (err) {
-    console.warn('Gemini 2.5 Flash API call failed. Using deterministic engine fallback.', err);
+    console.warn('Gemini 3.8 Flash API call failed. Using deterministic engine fallback.', err);
     const fallback = generateDeterministicPlan(event);
     return {
       plan: {
@@ -217,7 +217,7 @@ Do not provide wedding suggestions unless the user asks about a wedding.
 `;
 
     const response = await ai.models.generateContent({
-      model: 'gemini-2.5-flash',
+      model: 'gemini-3.8-flash',
       contents: prompt,
       config: { responseMimeType: 'application/json' },
     });
@@ -248,7 +248,7 @@ Do not provide wedding suggestions unless the user asks about a wedding.
     return {
       title: parsed.title,
       ideas,
-      model: 'Gemini 2.5 Flash',
+      model: 'Gemini 3.8 Flash',
     };
   } catch (err) {
     console.error('Gemini idea generation failed:', err);
@@ -256,7 +256,7 @@ Do not provide wedding suggestions unless the user asks about a wedding.
       title: `AI temporarily unavailable — ${event.name}`,
       ideas: [
         'The Gemini request failed. Check the Render application logs for details.',
-        'Verify that the API key is valid and Gemini 2.5 Flash is accessible.',
+        'Verify that the API key is valid and Gemini 3.8 Flash is accessible.',
       ],
       model: 'AI Unavailable',
     };
