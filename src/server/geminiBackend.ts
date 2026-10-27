@@ -175,7 +175,6 @@ Ensure numeric budget allocations sum to approximately the total budget. Ensure 
     };
   }
 }
-
 export async function processIdeasRequest(
   event: CelebrationEvent,
   userPrompt: string
@@ -183,55 +182,83 @@ export async function processIdeasRequest(
   const ai = getAIClient();
 
   if (!ai) {
+    console.error('Gemini unavailable: GEMINI_API_KEY is missing or invalid.');
     return {
-      title: `Creative Ideas for ${event.name}`,
+      title: `AI unavailable — ${event.name}`,
       ideas: [
-        `Curate an interactive dessert tasting station reflecting favorite flavors.`,
-        `Design customized event programs printed on seed paper that guests can plant at home.`,
-        `Arrange low-height centerpiece florals to foster easy cross-table conversation.`,
-        `Organize a live acoustic welcome set during guest arrival.`,
+        'Gemini is not configured. Check the GEMINI_API_KEY environment variable in Render.',
       ],
-      model: 'Celebria Heuristic Engine',
+      model: 'AI Unavailable',
     };
   }
 
   try {
     const prompt = `
-For the celebration "${event.name}" (${event.type}, ${event.guestCount} guests, budget ${event.totalBudget} ${event.currency}, theme: ${event.theme || 'Celebration'}):
-Provide 4-5 practical, creative ideas responding to: "${userPrompt}".
-Format as a clean JSON object:
+You are Celebria AI, a creative celebration planner.
+Answer the user's actual request and never substitute a different event.
+
+EVENT: ${event.name}
+TYPE: ${event.type}
+GUESTS: ${event.guestCount}
+BUDGET: ${event.totalBudget} ${event.currency}
+THEME: ${event.theme || 'Not specified'}
+
+USER REQUEST:
+${userPrompt}
+
+Return only valid JSON:
 {
-  "title": "Short title",
-  "ideas": ["Idea 1", "Idea 2", "Idea 3", "Idea 4"]
+  "title": "A specific title for the request",
+  "ideas": ["Idea 1", "Idea 2", "Idea 3"]
 }
+
+Give exactly 3 practical, specific ideas. Respect the event type and budget.
+Do not provide wedding suggestions unless the user asks about a wedding.
 `;
 
     const response = await ai.models.generateContent({
       model: 'gemini-2.5-flash',
       contents: prompt,
-      config: {
-        responseMimeType: 'application/json',
-      },
+      config: { responseMimeType: 'application/json' },
     });
 
-    const rawText = response.text || '';
-    const cleanJson = rawText.replace(/^```json\s*/, '').replace(/\s*```$/, '').trim();
-    const parsed = JSON.parse(cleanJson);
+    const rawText = (response.text || '')
+      .replace(/^```json\s*/, '')
+      .replace(/\s*```$/, '')
+      .trim();
+
+    const parsed = JSON.parse(rawText);
+
+    if (
+      typeof parsed.title !== 'string' ||
+      !Array.isArray(parsed.ideas) ||
+      parsed.ideas.length === 0
+    ) {
+      throw new Error('Gemini returned an invalid ideas response.');
+    }
+
+    const ideas = parsed.ideas
+      .filter((idea: unknown): idea is string => typeof idea === 'string')
+      .slice(0, 3);
+
+    if (ideas.length === 0) {
+      throw new Error('Gemini returned no valid ideas.');
+    }
 
     return {
-      title: parsed.title || 'Creative Ideas',
-      ideas: Array.isArray(parsed.ideas) ? parsed.ideas : [],
+      title: parsed.title,
+      ideas,
       model: 'Gemini 2.5 Flash',
     };
-  } catch {
+  } catch (err) {
+    console.error('Gemini idea generation failed:', err);
     return {
-      title: `Ideas for ${event.name}`,
+      title: `AI temporarily unavailable — ${event.name}`,
       ideas: [
-        `Incorporate personal storytelling moments or photos along the entry hallway.`,
-        `Create signature mocktail and cocktail pairings for the menu.`,
-        `Provide comfortable lounge seating pockets away from the dance floor.`,
+        'The Gemini request failed. Check the Render application logs for details.',
+        'Verify that the API key is valid and Gemini 2.5 Flash is accessible.',
       ],
-      model: 'Celebria Heuristic Engine',
+      model: 'AI Unavailable',
     };
   }
 }
