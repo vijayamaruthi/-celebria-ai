@@ -141,7 +141,7 @@ Ensure numeric budget allocations sum to approximately the total budget. Ensure 
 
   try {
     const response = await ai.models.generateContent({
-      model: 'gemini-3.8-flash',
+      model: 'gemini-2.5-flash',
       contents: prompt,
       config: {
         responseMimeType: 'application/json',
@@ -157,13 +157,13 @@ Ensure numeric budget allocations sum to approximately the total budget. Ensure 
         ...parsed,
         eventId: event.id,
         isFallback: false,
-        modelUsed: 'Gemini 3.8 Flash',
+        modelUsed: 'Gemini 2.5 Flash',
         generatedAt: new Date().toISOString(),
       },
-      model: 'Gemini 3.8 Flash',
+      model: 'Gemini 2.5 Flash',
     };
   } catch (err) {
-    console.warn('Gemini 3.8 Flash API call failed. Using deterministic engine fallback.', err);
+    console.warn('Gemini 2.5 Flash API call failed. Using deterministic engine fallback.', err);
     const fallback = generateDeterministicPlan(event);
     return {
       plan: {
@@ -207,7 +207,7 @@ Format as a clean JSON object:
 `;
 
     const response = await ai.models.generateContent({
-      model: 'gemini-3.8-flash',
+      model: 'gemini-2.5-flash',
       contents: prompt,
       config: {
         responseMimeType: 'application/json',
@@ -221,7 +221,7 @@ Format as a clean JSON object:
     return {
       title: parsed.title || 'Creative Ideas',
       ideas: Array.isArray(parsed.ideas) ? parsed.ideas : [],
-      model: 'Gemini 3.8 Flash',
+      model: 'Gemini 2.5 Flash',
     };
   } catch {
     return {
