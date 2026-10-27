@@ -21,7 +21,7 @@ ENV NODE_ENV=production
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev
 
-RUN npm install --no-save tsx
+RUN npm install --no-save tsx esbuild @esbuild/linux-x64
 
 COPY --from=builder /app/dist ./dist
 COPY --from=builder /app/server.ts ./server.ts
