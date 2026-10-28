@@ -44,6 +44,25 @@ function parseExplicitGuestCount(prompt: string): number | undefined {
   return Number.isSafeInteger(count) && count > 0 ? count : undefined;
 }
 
+function parseExplicitDate(prompt: string): string | undefined {
+  const isoDate = prompt.match(/\b\d{4}-\d{2}-\d{2}\b/);
+  if (isoDate) return isoDate[0];
+
+  const month = '(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)';
+  const monthFirst = prompt.match(new RegExp(`\\b${month}\\s+\\d{1,2}(?:st|nd|rd|th)?(?:,?\\s+\\d{4})?\\b`, 'i'));
+  if (monthFirst) return monthFirst[0].replace(/\s+/g, ' ').trim();
+
+  const dayFirst = prompt.match(new RegExp(`\\b\\d{1,2}(?:st|nd|rd|th)?\\s+${month}(?:,?\\s+\\d{4})?\\b`, 'i'));
+  return dayFirst?.[0].replace(/\s+/g, ' ').trim();
+}
+
+function parseExplicitTime(prompt: string): string | undefined {
+  const match = prompt.match(
+    /\b(?:at|around|by)\s+((?:1[0-2]|0?[1-9])(?::[0-5]\d)?\s*(?:am|pm)|(?:[01]?\d|2[0-3]):[0-5]\d)\b/i
+  );
+  return match?.[1].replace(/\s+/g, ' ').trim();
+}
+
 function currencyFromToken(token: string | undefined): string | undefined {
   if (!token) return undefined;
   const normalized = token.toUpperCase().replace(/\./g, '');
@@ -88,6 +107,8 @@ export function resolveFocusedIdeasEventContext(
   const explicitBudget = parseExplicitBudget(prompt);
   const explicitLocation = parseExplicitLocation(prompt);
   const explicitGuestCount = parseExplicitGuestCount(prompt);
+  const explicitDate = parseExplicitDate(prompt);
+  const explicitTime = parseExplicitTime(prompt);
   const name = explicitType && explicitType !== event.type
     ? `${displayEventType(type)} Celebration`
     : (event.name || `${displayEventType(type)} Celebration`).replace(/\bweeding\b/gi, (word) =>
@@ -98,8 +119,10 @@ export function resolveFocusedIdeasEventContext(
     ...event,
     name,
     type,
-    date: workspaceContextRelevant ? event.date : '',
-    time: workspaceContextRelevant ? event.time : undefined,
+    // Date and time are request details only when stated in the current question.
+    // Persisted workspace dates may be stale even when the event type matches.
+    date: explicitDate ?? '',
+    time: explicitTime,
     location: explicitLocation ?? (workspaceContextRelevant ? event.location : ''),
     guestCount: explicitGuestCount ?? (workspaceContextRelevant ? event.guestCount : 0),
     totalBudget: explicitBudget?.amount ?? (workspaceContextRelevant ? event.totalBudget : Number.NaN),
@@ -143,9 +166,10 @@ export function generateFocusedIdeasFallback(
   const location = resolvedEvent.location?.trim() || 'location not stated in the question';
   const workspaceContextRelevant = resolvedEvent.type === event.type;
   const venueType = workspaceContextRelevant ? resolvedEvent.venueType || 'venue' : 'venue type not stated in the question';
-  const dateTime = resolvedEvent.date
-    ? `${resolvedEvent.date}${resolvedEvent.time ? ` at ${resolvedEvent.time}` : ''}`
-    : 'date to be confirmed';
+  const dateTime = [
+    resolvedEvent.date,
+    resolvedEvent.time ? `at ${resolvedEvent.time}` : '',
+  ].filter(Boolean).join(' ');
   const currency = resolvedEvent.currency || (workspaceContextRelevant ? 'USD' : '');
   const totalBudget = Number.isFinite(resolvedEvent.totalBudget)
     ? currency
@@ -162,7 +186,8 @@ export function generateFocusedIdeasFallback(
   const regionalPlaylist = /\b(?:Bangalore|Bengaluru)\b/i.test(location)
     ? 'a curated Kannada or other regional playlist'
     : 'a curated local or regional playlist';
-  const context = `${eventType} “${eventName}” on ${dateTime}, for ${guestCount} guests at ${location} (${venueType}), within a total budget of ${totalBudget}`;
+  const dateTimeContext = dateTime ? ` on ${dateTime}` : '';
+  const context = `${eventType} “${eventName}”${dateTimeContext}, for ${guestCount} guests at ${location} (${venueType}), within a total budget of ${totalBudget}`;
   const contextDetails = [
     `theme: ${theme}`,
     priorities ? `priorities: ${priorities}` : '',

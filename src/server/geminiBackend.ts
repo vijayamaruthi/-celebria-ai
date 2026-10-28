@@ -26,6 +26,7 @@ export interface GeminiRetryOptions {
   /** Opt into broader fetch/abort error matching for the Ideas endpoint only. */
   retryAbortErrors?: boolean;
   retryFailedFetchErrors?: boolean;
+  signal?: AbortSignal;
   wait?: (delayMs: number) => Promise<void>;
 }
 
@@ -37,11 +38,12 @@ export interface PlanRequestDependencies {
 export interface IdeasRequestDependencies {
   generateContent?: (prompt: string) => Promise<GeminiContentResponse>;
   retryOptions?: GeminiRetryOptions;
+  signal?: AbortSignal;
 }
 
 const DEFAULT_RETRY_OPTIONS: Required<Omit<
   GeminiRetryOptions,
-  'wait' | 'jitter' | 'random' | 'retryAbortErrors' | 'retryFailedFetchErrors'
+  'wait' | 'jitter' | 'random' | 'retryAbortErrors' | 'retryFailedFetchErrors' | 'signal'
 >> = {
   maxAttempts: 3,
   initialDelayMs: 500,
@@ -49,6 +51,7 @@ const DEFAULT_RETRY_OPTIONS: Required<Omit<
 };
 const MAX_RETRY_ATTEMPTS = 3;
 const MAX_RETRY_DELAY_MS = 5000;
+const IDEAS_GEMINI_ATTEMPT_TIMEOUT_MS = 20_000;
 const TRANSIENT_NETWORK_CODES = new Set([
   'ECONNRESET',
   'ECONNREFUSED',
@@ -65,8 +68,18 @@ const TRANSIENT_NETWORK_CODES = new Set([
   'UND_ERR_SOCKET',
 ]);
 
-function waitForRetry(delayMs: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, delayMs));
+function waitForRetry(delayMs: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    let timer: ReturnType<typeof setTimeout>;
+    const finish = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener('abort', finish);
+      resolve();
+    };
+    timer = setTimeout(finish, delayMs);
+    signal?.addEventListener('abort', finish, { once: true });
+    if (signal?.aborted) finish();
+  });
 }
 
 function getErrorStatus(error: unknown): number | undefined {
@@ -156,13 +169,24 @@ function isTransientNetworkError(
   return false;
 }
 
+function combineAbortSignals(signals: Array<AbortSignal | undefined>): AbortSignal | undefined {
+  const activeSignals = signals.filter((signal): signal is AbortSignal => signal !== undefined);
+  if (activeSignals.length === 0) return undefined;
+  if (activeSignals.length === 1) return activeSignals[0];
+  return AbortSignal.any(activeSignals);
+}
+
 /**
  * The GenAI SDK's ApiError retains the status but drops response headers. Preserve
  * headers for 429 errors so the bounded retry policy can honor Retry-After.
  */
-export function createRetryAwareGeminiFetch(fetcher: typeof fetch = fetch): typeof fetch {
+export function createRetryAwareGeminiFetch(
+  fetcher: typeof fetch = fetch,
+  requestSignal?: AbortSignal
+): typeof fetch {
   return async (input, init) => {
-    const response = await fetcher(input, init);
+    const signal = combineAbortSignals([init?.signal ?? undefined, requestSignal]);
+    const response = await fetcher(input, { ...init, signal });
     if (response.status !== 429) return response;
 
     const error = Object.assign(new Error('Gemini API rate limited (HTTP 429)'), {
@@ -195,12 +219,16 @@ export async function retryGeminiRequest<T>(
     ? Math.min(1, Math.max(0, requestedJitter))
     : 0;
   const random = options.random ?? Math.random;
-  const wait = options.wait ?? waitForRetry;
+  const wait = options.wait;
 
   for (let attempt = 1; ; attempt++) {
+    if (options.signal?.aborted) {
+      throw options.signal.reason ?? Object.assign(new Error('Gemini request cancelled'), { name: 'AbortError' });
+    }
     try {
       return await request();
     } catch (error) {
+      if (options.signal?.aborted) throw error;
       const status = getErrorStatus(error);
       // A known HTTP status takes precedence so authentication and request errors
       // never get retried just because an attached cause happens to look transient.
@@ -226,7 +254,9 @@ export async function retryGeminiRequest<T>(
         maxDelayMs,
         Math.max(0, exponentialDelayMs * (1 + ((safeRandomValue * 2) - 1) * jitter))
       );
-      await wait(Math.max(jitteredDelayMs, retryAfterMs ?? 0));
+      const delayMs = Math.max(jitteredDelayMs, retryAfterMs ?? 0);
+      if (wait) await wait(delayMs);
+      else await waitForRetry(delayMs, options.signal);
     }
   }
 }
@@ -252,20 +282,30 @@ function getAIClient(): GoogleGenAI | null {
   return aiInstance;
 }
 
-function getIdeasAIClient(): GoogleGenAI | null {
+export function createIdeasAIClient(
+  apiKey: string,
+  fetcher: typeof fetch = fetch,
+  timeoutMs = IDEAS_GEMINI_ATTEMPT_TIMEOUT_MS,
+  requestSignal?: AbortSignal
+): GoogleGenAI {
+  return new GoogleGenAI({
+    apiKey,
+    httpOptions: {
+      headers: { 'User-Agent': 'aistudio-build' },
+      fetch: createRetryAwareGeminiFetch(fetcher, requestSignal),
+      // This per-attempt timeout also communicates the server deadline to Gemini.
+      timeout: timeoutMs,
+      retryOptions: { attempts: 1 },
+    },
+  });
+}
+
+function getIdeasAIClient(requestSignal?: AbortSignal): GoogleGenAI | null {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey || apiKey === 'MY_GEMINI_API_KEY' || apiKey.trim() === '') return null;
+  if (requestSignal) return createIdeasAIClient(apiKey, fetch, IDEAS_GEMINI_ATTEMPT_TIMEOUT_MS, requestSignal);
   if (!ideasAiInstance) {
-    ideasAiInstance = new GoogleGenAI({
-      apiKey,
-      httpOptions: {
-        headers: { 'User-Agent': 'aistudio-build' },
-        fetch: createRetryAwareGeminiFetch(),
-        // Give each outer retry a finite lifetime; retryGeminiRequest owns the total attempt budget.
-        timeout: 15000,
-        retryOptions: { attempts: 1 },
-      },
-    });
+    ideasAiInstance = createIdeasAIClient(apiKey);
   }
   return ideasAiInstance;
 }
@@ -511,12 +551,14 @@ export async function processIdeasRequest(
   userPrompt: string,
   dependencies: IdeasRequestDependencies = {}
 ): Promise<{ title: string; ideas: string[]; model: string }> {
-  const ai = dependencies.generateContent ? null : getIdeasAIClient();
+  const ai = dependencies.generateContent ? null : getIdeasAIClient(dependencies.signal);
   const requestEvent = resolveFocusedIdeasEventContext(event, userPrompt);
   const useFallback = () => {
     const fallback = generateFocusedIdeasFallback(event, userPrompt);
     return { title: fallback.title, ideas: fallback.ideas, model: fallback.source };
   };
+  const requestStartedAt = Date.now();
+  const attemptDurationsMs: number[] = [];
 
   if (!ai && !dependencies.generateContent) return useFallback();
 
@@ -553,19 +595,29 @@ Give exactly 3 practical, specific ideas. Respect the event type and budget.
 Do not provide wedding suggestions unless the user asks about a wedding.
 `;
 
-    const response = await retryGeminiRequest(
-      dependencies.generateContent
-        ? () => dependencies.generateContent!(prompt)
-        : () => ai!.models.generateContent({
+    const generateContent = async () => {
+      const attemptStartedAt = Date.now();
+      try {
+        return await (dependencies.generateContent
+          ? dependencies.generateContent(prompt)
+          : ai!.models.generateContent({
             model: 'gemini-3.8-flash',
             contents: prompt,
             config: { responseMimeType: 'application/json' },
-          }),
+          }));
+      } finally {
+        attemptDurationsMs.push(Date.now() - attemptStartedAt);
+      }
+    };
+
+    const response = await retryGeminiRequest(
+      generateContent,
       {
         jitter: 0.2,
         retryAbortErrors: true,
         retryFailedFetchErrors: true,
         ...dependencies.retryOptions,
+        signal: dependencies.signal ?? dependencies.retryOptions?.signal,
       }
     );
 
@@ -594,11 +646,15 @@ Do not provide wedding suggestions unless the user asks about a wedding.
       model: 'Gemini 3.8 Flash',
     };
   } catch (err) {
+    if (dependencies.signal?.aborted) return useFallback();
     // Keep prompts, event notes, API key material, and raw provider errors out of logs.
     const status = getErrorStatus(err);
     console.warn(
       'Gemini idea generation failed; using contextual fallback.',
-      status ? `HTTP ${status}` : 'request/network error'
+      status ? `HTTP ${status}` : 'request/network error',
+      `attempts=${attemptDurationsMs.length}`,
+      `attemptDurationsMs=${attemptDurationsMs.join(',')}`,
+      `totalMs=${Date.now() - requestStartedAt}`
     );
     return useFallback();
   }

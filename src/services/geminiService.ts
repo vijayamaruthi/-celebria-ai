@@ -7,6 +7,8 @@ import { CelebrationEvent, AIPlanningResult } from '../types';
 import { generateDeterministicPlan } from '../utils/deterministicPlanner';
 import { generateFocusedIdeasFallback } from '../utils/focusedIdeasFallback';
 
+const FOCUSED_IDEAS_REQUEST_TIMEOUT_MS = 75_000;
+
 export interface PlanGenerationOptions {
   customFocus?: string;
   forceDeterministic?: boolean;
@@ -84,12 +86,15 @@ export async function generateFocusedIdeas(
   prompt: string
 ): Promise<{ title: string; ideas: string[]; source: string }> {
   const fallback = () => generateFocusedIdeasFallback(event, prompt);
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), FOCUSED_IDEAS_REQUEST_TIMEOUT_MS);
 
   try {
     const response = await fetch('/api/ideas', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ event, prompt }),
+      signal: controller.signal,
     });
 
     if (!response.ok) return fallback();
@@ -114,6 +119,8 @@ export async function generateFocusedIdeas(
     }
   } catch {
     // Use the same contextual fallback if the API is unreachable or returns invalid JSON.
+  } finally {
+    clearTimeout(timeoutId);
   }
 
   return fallback();

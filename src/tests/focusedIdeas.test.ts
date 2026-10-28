@@ -118,7 +118,7 @@ export function testFocusedIdeas() {
   });
 
   tests.push({
-    name: 'Retains workspace details that the current question does not contradict',
+    name: 'Retains relevant workspace details but omits an unstated saved date and time',
     run: async () => {
       const event = makeEvent();
       const resolved = resolveFocusedIdeasEventContext(
@@ -130,6 +130,39 @@ export function testFocusedIdeas() {
       assert(resolved.guestCount === event.guestCount, 'Expected the workspace guest count to remain when unstated');
       assert(resolved.totalBudget === event.totalBudget, 'Expected the workspace budget to remain when unstated');
       assert(resolved.currency === event.currency, 'Expected the workspace currency to remain when unstated');
+      assert(resolved.date === '', 'A saved date must not be treated as stated in the current question');
+      assert(resolved.time === undefined, 'A saved time must not be treated as stated in the current question');
+
+      let submittedPrompt = '';
+      await processIdeasRequest(event, 'Suggest budget-friendly entertainment and games for a birthday.', {
+        generateContent: async (prompt) => {
+          submittedPrompt = prompt;
+          return responseText('Birthday entertainment');
+        },
+      });
+      assert(submittedPrompt.includes('DATE: Not stated in the current question'), 'Expected the Gemini prompt to mark the date as unstated');
+      assert(!submittedPrompt.includes(event.date), 'Stale workspace date must not reach Gemini');
+      assert(!event.time || !submittedPrompt.includes(event.time), 'Stale workspace time must not reach Gemini');
+    },
+  });
+
+  tests.push({
+    name: 'Preserves a date and time explicitly stated in the current question',
+    run: async () => {
+      const event = makeEvent();
+      const question = 'Suggest birthday entertainment for 2028-09-12 at 6:30 PM.';
+      const resolved = resolveFocusedIdeasEventContext(event, question);
+      let submittedPrompt = '';
+      await processIdeasRequest(event, question, {
+        generateContent: async (prompt) => {
+          submittedPrompt = prompt;
+          return responseText('Birthday entertainment');
+        },
+      });
+
+      assert(resolved.date === '2028-09-12', `Expected the explicit date, got ${resolved.date}`);
+      assert(resolved.time === '6:30 PM', `Expected the explicit time, got ${resolved.time}`);
+      assert(submittedPrompt.includes('DATE: 2028-09-12 at 6:30 PM'), 'Expected the Gemini request to include the explicit date and time');
     },
   });
 
@@ -157,6 +190,60 @@ export function testFocusedIdeas() {
       assert(attempts === 2, `Expected one retry, got ${attempts} attempts`);
       assert(delays.join(',') === '80', `Expected 20% jittered 100ms backoff, got ${delays}`);
       assert(result.model === 'Gemini 3.8 Flash', 'Expected a recovered request to be labeled as Gemini');
+    },
+  });
+
+  tests.push({
+    name: 'Retries a transient HTTP 504 and accepts the successful Gemini response',
+    run: async () => {
+      let attempts = 0;
+      const delays: number[] = [];
+      const result = await processIdeasRequest(makeEvent(), 'Suggest birthday entertainment', {
+        generateContent: async () => {
+          attempts++;
+          if (attempts === 1) throw Object.assign(new Error('deadline exceeded'), { status: 504 });
+          return responseText('Recovered birthday entertainment');
+        },
+        retryOptions: {
+          initialDelayMs: 25,
+          maxDelayMs: 100,
+          jitter: 0,
+          wait: async (delayMs) => { delays.push(delayMs); },
+        },
+      });
+
+      assert(attempts === 2, `Expected one retry after HTTP 504, got ${attempts} attempts`);
+      assert(delays.join(',') === '25', `Expected one bounded backoff, got ${delays}`);
+      assert(result.title === 'Recovered birthday entertainment', 'Expected the successful Gemini result');
+      assert(result.model === 'Gemini 3.8 Flash', 'Expected Gemini source after the retry succeeds');
+    },
+  });
+
+  tests.push({
+    name: 'Falls back after repeated HTTP 504 without adding the workspace date or time',
+    run: async () => {
+      let attempts = 0;
+      const question = 'Suggest budget-friendly entertainment and games for a birthday.';
+      const result = await processIdeasRequest(makeEvent(), question, {
+        generateContent: async () => {
+          attempts++;
+          throw Object.assign(new Error('deadline exceeded'), { status: 504 });
+        },
+        retryOptions: {
+          initialDelayMs: 10,
+          maxDelayMs: 100,
+          jitter: 0,
+          wait: async () => undefined,
+        },
+      });
+
+      const joinedIdeas = result.ideas.join(' ');
+      assert(attempts === 3, `Expected the three-attempt cap before fallback, got ${attempts}`);
+      assert(result.model === 'Celebria Heuristic Engine (Contextual Fallback)', 'Expected contextual fallback source');
+      assert(joinedIdeas.includes(question), 'Expected the fallback to preserve the current question');
+      assert(joinedIdeas.includes('Auckland'), 'Expected relevant workspace location to remain supplemental context');
+      assert(!joinedIdeas.includes('2027-08-14'), 'An unstated workspace date must not appear in the fallback');
+      assert(!joinedIdeas.includes('17:30'), 'An unstated workspace time must not appear in the fallback');
     },
   });
 
@@ -205,6 +292,9 @@ export function testFocusedIdeas() {
         assert(!joinedIdeas.includes('Starlit garden'), 'Unrelated workspace theme must not appear in fallback');
         assert(!joinedIdeas.includes('vegan'), 'Unrelated workspace dietary notes must not appear in fallback');
         assert(warning.includes('HTTP 503'), 'Expected only the safe provider status in the warning');
+        assert(warning.includes('attempts=3'), 'Expected safe attempt-count diagnostics');
+        assert(warning.includes('attemptDurationsMs='), 'Expected safe per-attempt duration diagnostics');
+        assert(warning.includes('totalMs='), 'Expected safe total-duration diagnostics');
         assert(!warning.includes(BANGALORE_WEDDING_QUESTION), 'Expected private request text to stay out of logs');
       } finally {
         console.warn = originalWarn;
@@ -305,6 +395,26 @@ export function testFocusedIdeas() {
       assert(attempts === 3, `Expected retries for network and timeout errors, got ${attempts}`);
       assert(delays.join(',') === '20,40', `Expected exponential network backoff, got ${delays}`);
       assert(result.model === 'Gemini 3.8 Flash', 'Expected recovered Gemini response');
+    },
+  });
+
+  tests.push({
+    name: 'Stops retrying when the API caller cancels the request',
+    run: async () => {
+      const requestController = new AbortController();
+      let attempts = 0;
+      const result = await processIdeasRequest(makeEvent(), 'Suggest birthday entertainment', {
+        signal: requestController.signal,
+        generateContent: async () => {
+          attempts++;
+          requestController.abort();
+          throw Object.assign(new Error('caller cancelled'), { name: 'AbortError' });
+        },
+        retryOptions: { wait: async () => undefined },
+      });
+
+      assert(attempts === 1, `Expected cancellation to stop retries after one attempt, got ${attempts}`);
+      assert(result.model === 'Celebria Heuristic Engine (Contextual Fallback)', 'Expected the safe local fallback result');
     },
   });
 

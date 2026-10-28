@@ -57,13 +57,13 @@ function celebriaApiPlugin(): Plugin {
               const result = await processPlanRequest(event, customFocus);
               res.setHeader('Content-Type', 'application/json');
               res.end(JSON.stringify(result));
-            } catch (err: unknown) {
+            } catch {
               res.statusCode = 500;
               res.setHeader('Content-Type', 'application/json');
               res.end(
                 JSON.stringify({
                   error: 'Internal server error processing plan',
-                  details: err instanceof Error ? err.message : 'Unknown error',
+                  details: 'Unexpected server error',
                 })
               );
             }
@@ -72,6 +72,11 @@ function celebriaApiPlugin(): Plugin {
         }
 
         if (req.url === '/api/ideas' && req.method === 'POST') {
+          const requestController = new AbortController();
+          res.once('close', () => {
+            if (!res.writableEnded) requestController.abort();
+          });
+
           let body = '';
           req.on('data', (chunk) => {
             body += chunk;
@@ -80,10 +85,12 @@ function celebriaApiPlugin(): Plugin {
             try {
               const { event, prompt } = JSON.parse(body);
               const { processIdeasRequest } = await import('./src/server/geminiBackend.ts');
-              const result = await processIdeasRequest(event, prompt);
+              const result = await processIdeasRequest(event, prompt, { signal: requestController.signal });
+              if (res.destroyed) return;
               res.setHeader('Content-Type', 'application/json');
               res.end(JSON.stringify(result));
             } catch {
+              if (res.destroyed) return;
               res.statusCode = 500;
               res.setHeader('Content-Type', 'application/json');
               res.end(

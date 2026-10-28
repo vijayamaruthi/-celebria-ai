@@ -7,6 +7,7 @@ import type { CelebrationEvent } from '../types/index';
 import { BUDGET_CATEGORIES } from '../types/index';
 import {
   createRetryAwareGeminiFetch,
+  createIdeasAIClient,
   processPlanRequest,
   retryGeminiRequest,
 } from '../server/geminiBackend';
@@ -365,6 +366,148 @@ export function testGeminiBackend() {
 
       assert(response.status === 200, `Expected the second response to succeed, got ${response.status}`);
       assert(delays.join(',') === '250', `Expected the HTTP Retry-After delay of 250ms, got ${delays}`);
+    },
+  });
+
+  tests.push({
+    name: 'Runs one installed-SDK fetch per outer retry and sends the Ideas deadline',
+    run: async () => {
+      let fetchAttempts = 0;
+      let serverTimeoutHeader = '';
+      const client = createIdeasAIClient('test-only-key', async (_input, init) => {
+        fetchAttempts++;
+        serverTimeoutHeader = new Headers(init?.headers).get('x-server-timeout') || '';
+        return new Response(JSON.stringify({ error: { code: 503, message: 'temporary test failure' } }), {
+          status: 503,
+          headers: { 'content-type': 'application/json' },
+        });
+      });
+
+      try {
+        await retryGeminiRequest(
+          () => client.models.generateContent({ model: 'gemini-3.8-flash', contents: 'test request' }),
+          { maxAttempts: 3, initialDelayMs: 0, maxDelayMs: 0, wait: async () => undefined }
+        );
+        throw new Error('Expected repeated HTTP 503 responses to exhaust retries');
+      } catch (error) {
+        assert(!(error instanceof Error && error.message === 'Expected repeated HTTP 503 responses to exhaust retries'), 'Expected SDK failure after HTTP 503');
+      }
+
+      assert(fetchAttempts === 3, `Expected one SDK fetch for each of three outer attempts, got ${fetchAttempts}`);
+      assert(serverTimeoutHeader === '20', `Expected the 20-second server deadline, got ${serverTimeoutHeader}`);
+    },
+  });
+
+  tests.push({
+    name: 'Aborts the installed-SDK fetch when its per-attempt timeout expires',
+    run: async () => {
+      let fetchAttempts = 0;
+      let requestSignal: AbortSignal | undefined;
+      const client = createIdeasAIClient('test-only-key', async (_input, init) => {
+        fetchAttempts++;
+        requestSignal = init?.signal ?? undefined;
+        return new Promise<Response>((_resolve, reject) => {
+          if (!requestSignal) {
+            reject(new Error('Expected the SDK to pass an abort signal to fetch'));
+            return;
+          }
+          const rejectOnAbort = () => reject(Object.assign(new Error('mock fetch aborted'), { name: 'AbortError' }));
+          if (requestSignal.aborted) rejectOnAbort();
+          else requestSignal.addEventListener('abort', rejectOnAbort, { once: true });
+        });
+      }, 10);
+
+      let rejected = false;
+      let guardTimer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await Promise.race([
+          client.models.generateContent({ model: 'gemini-3.8-flash', contents: 'timeout test' }),
+          new Promise<never>((_resolve, reject) => {
+            guardTimer = setTimeout(() => reject(new Error('SDK timeout did not abort the mocked fetch')), 250);
+          }),
+        ]);
+      } catch {
+        rejected = true;
+      } finally {
+        if (guardTimer) clearTimeout(guardTimer);
+      }
+
+      assert(rejected, 'Expected the timed-out SDK request to reject');
+      assert(fetchAttempts === 1, `Expected one SDK attempt, got ${fetchAttempts}`);
+      assert(requestSignal?.aborted === true, 'Expected the SDK timeout to abort its fetch signal');
+    },
+  });
+
+  tests.push({
+    name: 'Aborts the installed-SDK fetch when the API caller disconnects',
+    run: async () => {
+      const callerController = new AbortController();
+      let fetchAttempts = 0;
+      let fetchSignal: AbortSignal | undefined;
+      let markFetchStarted!: () => void;
+      const fetchStarted = new Promise<void>((resolve) => { markFetchStarted = resolve; });
+      const client = createIdeasAIClient('test-only-key', async (_input, init) => {
+        fetchAttempts++;
+        fetchSignal = init?.signal ?? undefined;
+        markFetchStarted();
+        return new Promise<Response>((_resolve, reject) => {
+          if (!fetchSignal) {
+            reject(new Error('Expected the SDK to pass a combined abort signal to fetch'));
+            return;
+          }
+          const rejectOnAbort = () => reject(Object.assign(new Error('mock fetch aborted'), { name: 'AbortError' }));
+          if (fetchSignal.aborted) rejectOnAbort();
+          else fetchSignal.addEventListener('abort', rejectOnAbort, { once: true });
+        });
+      }, 20_000, callerController.signal);
+      const generation = client.models.generateContent({ model: 'gemini-3.8-flash', contents: 'disconnect test' })
+        .then(() => false, () => true);
+
+      let startGuard: ReturnType<typeof setTimeout> | undefined;
+      const didStart = await Promise.race([
+        fetchStarted.then(() => true),
+        new Promise<boolean>((resolve) => { startGuard = setTimeout(() => resolve(false), 250); }),
+      ]);
+      if (startGuard) clearTimeout(startGuard);
+      assert(didStart, 'Expected the SDK to invoke the mocked fetch');
+
+      callerController.abort();
+      let abortGuard: ReturnType<typeof setTimeout> | undefined;
+      const didAbort = await Promise.race([
+        generation,
+        new Promise<boolean>((resolve) => { abortGuard = setTimeout(() => resolve(false), 250); }),
+      ]);
+      if (abortGuard) clearTimeout(abortGuard);
+
+      assert(didAbort, 'Expected the SDK generation to reject when the caller disconnects');
+      assert(fetchAttempts === 1, `Expected cancellation to avoid duplicate SDK calls, got ${fetchAttempts}`);
+      assert(fetchSignal?.aborted === true, 'Expected the caller disconnect to abort the SDK fetch signal');
+    },
+  });
+
+  tests.push({
+    name: 'Cancels retry backoff promptly when the API caller disconnects',
+    run: async () => {
+      const callerController = new AbortController();
+      let attempts = 0;
+      const startedAt = Date.now();
+
+      try {
+        await retryGeminiRequest(async () => {
+          attempts++;
+          setTimeout(() => callerController.abort(), 10);
+          throw Object.assign(new Error('temporary upstream failure'), { status: 503 });
+        }, {
+          signal: callerController.signal,
+          initialDelayMs: 500,
+          maxDelayMs: 500,
+        });
+      } catch {
+        // Cancellation should interrupt the pending delay and reject before another attempt.
+      }
+
+      assert(attempts === 1, `Expected no retry after cancellation during backoff, got ${attempts}`);
+      assert(Date.now() - startedAt < 300, 'Expected cancellation to interrupt the 500ms retry delay');
     },
   });
 

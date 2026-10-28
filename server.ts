@@ -69,6 +69,11 @@ app.post('/api/plan', async (req: Request, res: Response) => {
 
 // Creative Ideas endpoint
 app.post('/api/ideas', async (req: Request, res: Response) => {
+  const requestController = new AbortController();
+  res.once('close', () => {
+    if (!res.writableEnded) requestController.abort();
+  });
+
   try {
     const { event, prompt } = req.body;
     if (!event || !prompt) {
@@ -76,9 +81,11 @@ app.post('/api/ideas', async (req: Request, res: Response) => {
       return;
     }
 
-    const result = await processIdeasRequest(event, prompt);
+    const result = await processIdeasRequest(event, prompt, { signal: requestController.signal });
+    if (res.destroyed) return;
     res.json(result);
   } catch {
+    if (res.destroyed) return;
     // Avoid logging raw request/provider errors, which may contain user content or credentials.
     console.error('Failed to process /api/ideas request.');
     res.status(500).json({
