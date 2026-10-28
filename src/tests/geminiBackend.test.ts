@@ -8,6 +8,7 @@ import { BUDGET_CATEGORIES } from '../types/index';
 import {
   createRetryAwareGeminiFetch,
   createIdeasAIClient,
+  classifyGeminiFailure,
   processPlanRequest,
   retryGeminiRequest,
 } from '../server/geminiBackend';
@@ -132,6 +133,242 @@ export function testGeminiBackend() {
 
       assert(result === 'recovered', 'Expected the request to recover after rate limiting');
       assert(delays[0] === 200, `Expected Retry-After delay of 200ms, got ${delays[0]}`);
+    },
+  });
+
+  tests.push({
+    name: 'Classifies a structured request-rate 429 and uses a bounded body retry delay',
+    run: async () => {
+      let fetchAttempts = 0;
+      let observedFailureClass = '';
+      let observedMessage = '';
+      const delays: number[] = [];
+      const retryAwareFetch = createRetryAwareGeminiFetch(async () => {
+        fetchAttempts++;
+        if (fetchAttempts === 1) {
+          return new Response(JSON.stringify({
+            error: {
+              code: 429,
+              status: 'RESOURCE_EXHAUSTED',
+              message: 'Quota exceeded for requests per minute. Please retry in 0.25s. PRIVATE_PROVIDER_TEXT',
+              details: [{
+                '@type': 'type.googleapis.com/google.rpc.ErrorInfo',
+                reason: 'RATE_LIMIT_EXCEEDED',
+                metadata: { quota_metric: 'generate_content_requests_per_minute' },
+              }],
+            },
+          }), { status: 429, headers: { 'content-type': 'application/json' } });
+        }
+        return new Response('ok', { status: 200 });
+      });
+
+      const result = await retryGeminiRequest(async () => {
+        try {
+          return await retryAwareFetch('https://generativelanguage.googleapis.com/test');
+        } catch (error) {
+          observedFailureClass = classifyGeminiFailure(error);
+          observedMessage = error instanceof Error ? error.message : String(error);
+          throw error;
+        }
+      }, {
+        maxAttempts: 2,
+        initialDelayMs: 50,
+        maxDelayMs: 500,
+        wait: async (delayMs) => { delays.push(delayMs); },
+      });
+
+      assert(result.status === 200, 'Expected the retry to succeed after a structured rate-limit response');
+      assert(observedFailureClass === 'request_rate_limit', `Expected request-rate classification, got ${observedFailureClass}`);
+      assert(!observedMessage.includes('PRIVATE_PROVIDER_TEXT'), 'Provider error content must not escape the fetch wrapper');
+      assert(fetchAttempts === 2, `Expected a single bounded retry, got ${fetchAttempts} fetches`);
+      assert(delays.join(',') === '250', `Expected the 250ms body retry hint, got ${delays}`);
+    },
+  });
+
+  tests.push({
+    name: 'Stops after one structured daily-quota 429 without retrying',
+    run: async () => {
+      let fetchAttempts = 0;
+      const delays: number[] = [];
+      const retryAwareFetch = createRetryAwareGeminiFetch(async () => {
+        fetchAttempts++;
+        return new Response(JSON.stringify({
+          error: {
+            code: 429,
+            status: 'RESOURCE_EXHAUSTED',
+            message: 'Quota exceeded for this project. PRIVATE_QUOTA_DETAIL',
+            details: [{
+              '@type': 'type.googleapis.com/google.rpc.ErrorInfo',
+              reason: 'QUOTA_EXCEEDED',
+              metadata: { quota_limit: 'GenerateRequestsPerDayPerProject' },
+            }],
+          },
+        }), { status: 429, headers: { 'content-type': 'application/json' } });
+      });
+
+      try {
+        await retryGeminiRequest(() => retryAwareFetch('https://generativelanguage.googleapis.com/test'), {
+          maxAttempts: 3,
+          initialDelayMs: 50,
+          wait: async (delayMs) => { delays.push(delayMs); },
+        });
+        throw new Error('Expected daily quota exhaustion to stop retries');
+      } catch (error) {
+        assert(!(error instanceof Error && error.message === 'Expected daily quota exhaustion to stop retries'), 'Expected the original 429 to be retained');
+        assert(classifyGeminiFailure(error) === 'daily_quota', 'Expected daily quota classification');
+        assert(error instanceof Error && !error.message.includes('PRIVATE_QUOTA_DETAIL'), 'Raw quota details must not be retained');
+      }
+
+      assert(fetchAttempts === 1, `Expected no retry for daily quota exhaustion, got ${fetchAttempts} fetches`);
+      assert(delays.length === 0, 'Expected no retry delay for a non-recoverable quota response');
+    },
+  });
+
+  tests.push({
+    name: 'Retries a generic quota exhaustion only when a short RetryInfo is provided',
+    run: async () => {
+      let fetchAttempts = 0;
+      let observedClass = '';
+      const delays: number[] = [];
+      const retryAwareFetch = createRetryAwareGeminiFetch(async () => {
+        fetchAttempts++;
+        if (fetchAttempts === 1) {
+          return new Response(JSON.stringify({
+            error: {
+              code: 429,
+              status: 'RESOURCE_EXHAUSTED',
+              message: 'Resource quota exceeded.',
+              details: [
+                {
+                  '@type': 'type.googleapis.com/google.rpc.ErrorInfo',
+                  reason: 'QUOTA_EXCEEDED',
+                },
+                {
+                  '@type': 'type.googleapis.com/google.rpc.RetryInfo',
+                  retryDelay: '0.25s',
+                },
+              ],
+            },
+          }), { status: 429, headers: { 'content-type': 'application/json' } });
+        }
+        return new Response('ok', { status: 200 });
+      });
+
+      const result = await retryGeminiRequest(async () => {
+        try {
+          return await retryAwareFetch('https://generativelanguage.googleapis.com/test');
+        } catch (error) {
+          observedClass = classifyGeminiFailure(error);
+          throw error;
+        }
+      }, {
+        maxAttempts: 2,
+        maxDelayMs: 500,
+        wait: async (delayMs) => { delays.push(delayMs); },
+      });
+
+      assert(result.status === 200, 'Expected the request to recover after its short quota retry hint');
+      assert(observedClass === 'quota_exhausted', `Expected generic quota classification, got ${observedClass}`);
+      assert(fetchAttempts === 2, `Expected one retry with a short provider hint, got ${fetchAttempts}`);
+      assert(delays.length === 1 && delays[0] >= 250 && delays[0] <= 5000, `Expected one wait that honors the 250ms hint within the cap, got ${delays}`);
+    },
+  });
+
+  tests.push({
+    name: 'Stops after one structured billing or spend-limit 429 without retrying',
+    run: async () => {
+      let fetchAttempts = 0;
+      const retryAwareFetch = createRetryAwareGeminiFetch(async () => {
+        fetchAttempts++;
+        return new Response(JSON.stringify({
+          error: {
+            code: 429,
+            status: 'RESOURCE_EXHAUSTED',
+            message: 'The project spend cap has been exceeded.',
+            details: [{
+              '@type': 'type.googleapis.com/google.rpc.ErrorInfo',
+              reason: 'SPEND_LIMIT_EXCEEDED',
+              metadata: { limit: 'project_spend_cap' },
+            }],
+          },
+        }), { status: 429, headers: { 'content-type': 'application/json' } });
+      });
+
+      try {
+        await retryGeminiRequest(() => retryAwareFetch('https://generativelanguage.googleapis.com/test'), {
+          maxAttempts: 3,
+          wait: async () => { throw new Error('Billing limits must not trigger retry waits'); },
+        });
+        throw new Error('Expected spend-limit exhaustion to stop retries');
+      } catch (error) {
+        assert(!(error instanceof Error && error.message === 'Expected spend-limit exhaustion to stop retries'), 'Expected the original 429 to be retained');
+        assert(classifyGeminiFailure(error) === 'billing_or_spend_limit', 'Expected billing/spend classification');
+      }
+
+      assert(fetchAttempts === 1, `Expected one request for a non-recoverable spend limit, got ${fetchAttempts}`);
+    },
+  });
+
+  tests.push({
+    name: 'Honors RetryInfo and falls back without retrying before a long server wait',
+    run: async () => {
+      let fetchAttempts = 0;
+      const retryAwareFetch = createRetryAwareGeminiFetch(async () => {
+        fetchAttempts++;
+        return new Response(JSON.stringify({
+          error: {
+            code: 429,
+            status: 'RESOURCE_EXHAUSTED',
+            message: 'Rate limit exceeded',
+            details: [{
+              '@type': 'type.googleapis.com/google.rpc.RetryInfo',
+              retryDelay: '30s',
+            }],
+          },
+        }), { status: 429, headers: { 'content-type': 'application/json' } });
+      });
+
+      try {
+        await retryGeminiRequest(() => retryAwareFetch('https://generativelanguage.googleapis.com/test'), {
+          maxAttempts: 3,
+          maxDelayMs: 5000,
+          wait: async () => { throw new Error('Must not wait less than the provider recommendation'); },
+        });
+        throw new Error('Expected the retry to be suppressed for a long RetryInfo delay');
+      } catch (error) {
+        assert(!(error instanceof Error && error.message === 'Expected the retry to be suppressed for a long RetryInfo delay'), 'Expected the original 429 to be retained');
+        assert(classifyGeminiFailure(error) === 'rate_limit', 'Expected a rate-limit classification');
+      }
+
+      assert(fetchAttempts === 1, `Expected no early retry, got ${fetchAttempts} fetches`);
+    },
+  });
+
+  tests.push({
+    name: 'Classifies and exhausts transient 503 overload and 504 deadline failures',
+    run: async () => {
+      for (const [status, expectedClass] of [[503, 'service_overload'], [504, 'deadline_exceeded']] as const) {
+        let attempts = 0;
+        const delays: number[] = [];
+        try {
+          await retryGeminiRequest(async () => {
+            attempts++;
+            throw Object.assign(new Error(`Provider returned HTTP ${status}`), { status });
+          }, {
+            maxAttempts: 3,
+            initialDelayMs: 10,
+            maxDelayMs: 25,
+            jitter: 0,
+            wait: async (delayMs) => { delays.push(delayMs); },
+          });
+          throw new Error(`Expected HTTP ${status} to exhaust retries`);
+        } catch (error) {
+          assert(!(error instanceof Error && error.message === `Expected HTTP ${status} to exhaust retries`), `Expected HTTP ${status} to exhaust retries`);
+          assert(classifyGeminiFailure(error) === expectedClass, `Expected ${expectedClass} classification for HTTP ${status}`);
+        }
+        assert(attempts === 3, `Expected three attempts for HTTP ${status}, got ${attempts}`);
+        assert(delays.join(',') === '10,20', `Expected bounded delays for HTTP ${status}, got ${delays}`);
+      }
     },
   });
 

@@ -52,6 +52,44 @@ const DEFAULT_RETRY_OPTIONS: Required<Omit<
 const MAX_RETRY_ATTEMPTS = 3;
 const MAX_RETRY_DELAY_MS = 5000;
 const IDEAS_GEMINI_ATTEMPT_TIMEOUT_MS = 20_000;
+type GeminiFailureClass =
+  | 'request_rate_limit'
+  | 'token_rate_limit'
+  | 'rate_limit'
+  | 'daily_quota'
+  | 'project_quota'
+  | 'quota_exhausted'
+  | 'billing_or_spend_limit'
+  | 'unknown_429'
+  | 'service_overload'
+  | 'deadline_exceeded'
+  | 'timeout'
+  | 'authentication'
+  | 'permission_or_project_config'
+  | 'invalid_request'
+  | 'other';
+const NON_RECOVERABLE_429_CLASSES = new Set<GeminiFailureClass>([
+  'daily_quota',
+  'project_quota',
+  'billing_or_spend_limit',
+]);
+const SAFE_GEMINI_FAILURE_CLASSES = new Set<GeminiFailureClass>([
+  'request_rate_limit',
+  'token_rate_limit',
+  'rate_limit',
+  'daily_quota',
+  'project_quota',
+  'quota_exhausted',
+  'billing_or_spend_limit',
+  'unknown_429',
+  'service_overload',
+  'deadline_exceeded',
+  'timeout',
+  'authentication',
+  'permission_or_project_config',
+  'invalid_request',
+  'other',
+]);
 const TRANSIENT_NETWORK_CODES = new Set([
   'ECONNRESET',
   'ECONNREFUSED',
@@ -109,6 +147,89 @@ function getErrorStatus(error: unknown): number | undefined {
   return undefined;
 }
 
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
+}
+
+function parseRetryDelay(value: unknown): number | undefined {
+  if (typeof value !== 'string' && typeof value !== 'number') return undefined;
+  const text = String(value).trim();
+  const duration = text.match(/^(\d+(?:\.\d+)?)\s*(ms|milliseconds?|s|secs?|seconds?)$/i);
+  if (duration) {
+    const amount = Number(duration[1]);
+    const milliseconds = /^m/i.test(duration[2]) ? amount : amount * 1000;
+    return Number.isFinite(milliseconds) && milliseconds >= 0 ? milliseconds : undefined;
+  }
+  const seconds = Number(text);
+  return Number.isFinite(seconds) && seconds >= 0 ? seconds * 1000 : undefined;
+}
+
+function classify429Payload(payload: unknown): GeminiFailureClass {
+  const root = asRecord(payload);
+  const providerError = asRecord(root?.error);
+  if (!providerError) return 'unknown_429';
+
+  const messages: string[] = [];
+  if (typeof providerError.message === 'string') messages.push(providerError.message);
+  if (typeof providerError.status === 'string') messages.push(providerError.status);
+  const details = Array.isArray(providerError.details) ? providerError.details : [];
+  for (const detail of details) {
+    const record = asRecord(detail);
+    if (!record) continue;
+    const type = typeof record['@type'] === 'string' ? record['@type'] : '';
+    if (type.endsWith('google.rpc.ErrorInfo')) {
+      if (typeof record.reason === 'string') messages.push(record.reason);
+      const metadata = asRecord(record.metadata);
+      for (const key of ['quota_metric', 'quota_limit', 'quota_unit', 'limit']) {
+        if (typeof metadata?.[key] === 'string') messages.push(metadata[key] as string);
+      }
+    }
+  }
+
+  const diagnosticText = messages.join(' ')
+    .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+    .toLowerCase()
+    .replace(/[_-]+/g, ' ');
+  if (/\b(billing|spend(?: based)? limit|prepay|payment required|credit balance depleted)\b/.test(diagnosticText)) {
+    return 'billing_or_spend_limit';
+  }
+  if (/\b(daily|per day|requests per day|tokens per day|rpd)\b/.test(diagnosticText)) {
+    return 'daily_quota';
+  }
+  if (/\b(tokens? (?:per|\/)\s*(?:minute|second)|tpm|tokens per minute|tokens per second)\b/.test(diagnosticText)) {
+    return 'token_rate_limit';
+  }
+  if (/\b(requests? (?:per|\/)\s*(?:minute|second)|rpm|requests per minute|requests per second)\b/.test(diagnosticText)) {
+    return 'request_rate_limit';
+  }
+  if (/\b(rate limit exceeded|rate limit)\b/.test(diagnosticText)) return 'rate_limit';
+  if (/\b(project.{0,12}quota|quota.{0,12}project)\b/.test(diagnosticText)) return 'project_quota';
+  if (/\b(quota exceeded|quota exhausted|quota_exceeded)\b/.test(diagnosticText)) return 'quota_exhausted';
+  return 'unknown_429';
+}
+
+/** Return only a small allow-listed category; never return provider text or metadata. */
+export function classifyGeminiFailure(error: unknown): GeminiFailureClass {
+  const status = getErrorStatus(error);
+  if (status === 429) {
+    const value = asRecord(error);
+    const suppliedClass = value?.failureClass;
+    return typeof suppliedClass === 'string' && SAFE_GEMINI_FAILURE_CLASSES.has(suppliedClass as GeminiFailureClass)
+      ? suppliedClass as GeminiFailureClass
+      : 'unknown_429';
+  }
+  if (status === 503) return 'service_overload';
+  if (status === 504) return 'deadline_exceeded';
+  if (status === 408) return 'timeout';
+  if (status === 401) return 'authentication';
+  if (status === 403) return 'permission_or_project_config';
+  if (status === 400) return 'invalid_request';
+  if (status === 402) return 'billing_or_spend_limit';
+  return 'other';
+}
+
 function getRetryAfterMs(error: unknown): number | undefined {
   if (!error || typeof error !== 'object') return undefined;
 
@@ -134,12 +255,18 @@ function getRetryAfterMs(error: unknown): number | undefined {
     ? Number.NaN
     : Number(retryAfterMs);
   if (Number.isFinite(parsedMs) && parsedMs >= 0) return parsedMs;
-  if (typeof retryAfter !== 'string' && typeof retryAfter !== 'number') return undefined;
-  const seconds = Number(retryAfter);
-  if (Number.isFinite(seconds)) return Math.max(0, seconds * 1000);
+  if (typeof retryAfter === 'string' || typeof retryAfter === 'number') {
+    const seconds = Number(retryAfter);
+    if (Number.isFinite(seconds)) return Math.max(0, seconds * 1000);
 
-  const date = new Date(String(retryAfter)).getTime();
-  return Number.isNaN(date) ? undefined : Math.max(0, date - Date.now());
+    const date = new Date(String(retryAfter)).getTime();
+    if (!Number.isNaN(date)) return Math.max(0, date - Date.now());
+  }
+
+  const embeddedRetryAfterMs = asRecord(error)?.retryAfterMs;
+  return typeof embeddedRetryAfterMs === 'number' && Number.isFinite(embeddedRetryAfterMs) && embeddedRetryAfterMs >= 0
+    ? embeddedRetryAfterMs
+    : undefined;
 }
 
 function isTransientNetworkError(
@@ -189,11 +316,34 @@ export function createRetryAwareGeminiFetch(
     const response = await fetcher(input, { ...init, signal });
     if (response.status !== 429) return response;
 
-    const error = Object.assign(new Error('Gemini API rate limited (HTTP 429)'), {
+    let payload: unknown;
+    try {
+      payload = await response.json();
+    } catch {
+      // Some gateways return a non-JSON 429. Keep the failure generic and sanitized.
+    }
+    const failureClass = classify429Payload(payload);
+    const root = asRecord(payload);
+    const providerError = asRecord(root?.error);
+    const details = Array.isArray(providerError?.details) ? providerError.details : [];
+    let bodyRetryAfterMs: number | undefined;
+    for (const detail of details) {
+      const record = asRecord(detail);
+      if (!record || typeof record['@type'] !== 'string' || !record['@type'].endsWith('google.rpc.RetryInfo')) continue;
+      bodyRetryAfterMs = parseRetryDelay(record.retryDelay);
+      if (bodyRetryAfterMs !== undefined) break;
+    }
+    if (bodyRetryAfterMs === undefined && typeof providerError?.message === 'string') {
+      const retryMatch = providerError.message.match(/\bretry in\s+(\d+(?:\.\d+)?)\s*(ms|milliseconds?|s|secs?|seconds?)\b/i);
+      if (retryMatch) bodyRetryAfterMs = parseRetryDelay(`${retryMatch[1]} ${retryMatch[2]}`);
+    }
+
+    const error = Object.assign(new Error('Gemini API request failed (HTTP 429)'), {
       status: response.status,
       headers: response.headers,
+      failureClass,
+      retryAfterMs: bodyRetryAfterMs,
     });
-    void response.body?.cancel().catch(() => undefined);
     throw error;
   };
 }
@@ -242,6 +392,11 @@ export async function retryGeminiRequest<T>(
       if (!isTemporary || attempt >= maxAttempts) throw error;
 
       const retryAfterMs = status === 429 ? getRetryAfterMs(error) : undefined;
+      const failureClass = status === 429 ? classifyGeminiFailure(error) : 'other';
+      if (status === 429 && NON_RECOVERABLE_429_CLASSES.has(failureClass)) throw error;
+      // A generic quota-exhausted response is ambiguous. Retry only if the provider
+      // explicitly says the limit should clear within the allowed short wait.
+      if (status === 429 && failureClass === 'quota_exhausted' && retryAfterMs === undefined) throw error;
       // Respect a longer server rate-limit window by falling back instead of retrying too early.
       if (retryAfterMs !== undefined && retryAfterMs > maxDelayMs) throw error;
 
@@ -649,9 +804,12 @@ Do not provide wedding suggestions unless the user asks about a wedding.
     if (dependencies.signal?.aborted) return useFallback();
     // Keep prompts, event notes, API key material, and raw provider errors out of logs.
     const status = getErrorStatus(err);
+    const retryAfterMs = status === 429 ? getRetryAfterMs(err) : undefined;
     console.warn(
       'Gemini idea generation failed; using contextual fallback.',
       status ? `HTTP ${status}` : 'request/network error',
+      `failureClass=${classifyGeminiFailure(err)}`,
+      `retryAfterMs=${retryAfterMs === undefined ? 'unspecified' : Math.round(retryAfterMs)}`,
       `attempts=${attemptDurationsMs.length}`,
       `attemptDurationsMs=${attemptDurationsMs.join(',')}`,
       `totalMs=${Date.now() - requestStartedAt}`
