@@ -48,6 +48,14 @@ app.get('/api/download-zip', (_req: Request, res: Response) => {
 
 // Comprehensive AI Plan endpoint
 app.post('/api/plan', async (req: Request, res: Response) => {
+  const requestController = new AbortController();
+  const abortIfDisconnected = () => {
+    if (!res.writableEnded) requestController.abort();
+  };
+  req.once('aborted', abortIfDisconnected);
+  res.once('close', abortIfDisconnected);
+  if (req.aborted) requestController.abort();
+
   try {
     const { event, customFocus } = req.body;
     if (!event || !event.name || !event.type) {
@@ -55,15 +63,20 @@ app.post('/api/plan', async (req: Request, res: Response) => {
       return;
     }
 
-    const result = await processPlanRequest(event, customFocus);
+    const result = await processPlanRequest(event, customFocus, { signal: requestController.signal });
+    if (res.destroyed) return;
     res.json(result);
   } catch {
+    if (res.destroyed || requestController.signal.aborted) return;
     // Unexpected provider/request errors can contain sensitive details; keep them out of logs and responses.
     console.error('Failed to process /api/plan request.');
     res.status(500).json({
       error: 'Failed to process AI planning request',
       details: 'Unexpected server error',
     });
+  } finally {
+    req.off('aborted', abortIfDisconnected);
+    res.off('close', abortIfDisconnected);
   }
 });
 

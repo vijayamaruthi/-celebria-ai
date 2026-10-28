@@ -26,10 +26,10 @@ export async function generateCelebrationPlan(
     return generateDeterministicPlan(event);
   }
 
-  try {
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 20000); // 20s timeout
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 20000); // 20s timeout
 
+  try {
     const response = await fetch('/api/plan', {
       method: 'POST',
       headers: {
@@ -41,7 +41,6 @@ export async function generateCelebrationPlan(
       }),
       signal: controller.signal,
     });
-
     clearTimeout(timeoutId);
 
     if (!response.ok) {
@@ -75,6 +74,8 @@ export async function generateCelebrationPlan(
       isFallback: true,
       modelUsed: 'Celebria Heuristic Engine (Offline / Network Fallback)',
     };
+  } finally {
+    clearTimeout(timeoutId);
   }
 }
 

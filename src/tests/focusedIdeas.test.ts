@@ -7,6 +7,7 @@ import type { CelebrationEvent } from '../types/index';
 import { generateFocusedIdeas } from '../services/geminiService';
 import { processIdeasRequest, retryGeminiRequest } from '../server/geminiBackend';
 import { resolveFocusedIdeasEventContext } from '../utils/focusedIdeasFallback';
+import { acquireInFlightGuard, releaseInFlightGuard } from '../utils/inFlightGuard';
 
 const BANGALORE_WEDDING_QUESTION =
   'Suggest creative, budget-friendly entertainment ideas for a wedding in Bangalore with 200 guests and a total budget of ₹30,00,000. Include interactive games, guest activities, and practical recommendations.';
@@ -55,6 +56,22 @@ function responseText(title: string, ideas = ['First idea', 'Second idea', 'Thir
 
 export function testFocusedIdeas() {
   const tests: { name: string; run: () => Promise<void> }[] = [];
+
+  tests.push({
+    name: 'Synchronously rejects duplicate submissions and allows a later request',
+    run: async () => {
+      const planSubmission = { inFlight: false };
+      const ideasSubmission = { inFlight: false };
+
+      for (const submission of [planSubmission, ideasSubmission]) {
+        assert(acquireInFlightGuard(submission), 'Expected the first submission to acquire the guard');
+        assert(!acquireInFlightGuard(submission), 'Expected a same-tick duplicate submission to be rejected');
+        releaseInFlightGuard(submission);
+        assert(acquireInFlightGuard(submission), 'Expected a new submission to be allowed after completion');
+        releaseInFlightGuard(submission);
+      }
+    },
+  });
 
   tests.push({
     name: 'Generates three Gemini ideas and sends the complete event context and question',

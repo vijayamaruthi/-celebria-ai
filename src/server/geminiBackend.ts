@@ -33,6 +33,7 @@ export interface GeminiRetryOptions {
 export interface PlanRequestDependencies {
   generateContent?: () => Promise<GeminiContentResponse>;
   retryOptions?: GeminiRetryOptions;
+  signal?: AbortSignal;
 }
 
 export interface IdeasRequestDependencies {
@@ -251,11 +252,12 @@ function getRetryAfterMs(error: unknown): number | undefined {
     retryAfter = record['retry-after'] ?? record['Retry-After'];
   }
 
-  const parsedMs = retryAfterMs === undefined || retryAfterMs === null || retryAfterMs === ''
+  const parsedMs = retryAfterMs === undefined || retryAfterMs === null ||
+    (typeof retryAfterMs === 'string' && retryAfterMs.trim() === '')
     ? Number.NaN
     : Number(retryAfterMs);
   if (Number.isFinite(parsedMs) && parsedMs >= 0) return parsedMs;
-  if (typeof retryAfter === 'string' || typeof retryAfter === 'number') {
+  if ((typeof retryAfter === 'string' && retryAfter.trim() !== '') || typeof retryAfter === 'number') {
     const seconds = Number(retryAfter);
     if (Number.isFinite(seconds)) return Math.max(0, seconds * 1000);
 
@@ -394,9 +396,7 @@ export async function retryGeminiRequest<T>(
       const retryAfterMs = status === 429 ? getRetryAfterMs(error) : undefined;
       const failureClass = status === 429 ? classifyGeminiFailure(error) : 'other';
       if (status === 429 && NON_RECOVERABLE_429_CLASSES.has(failureClass)) throw error;
-      // A generic quota-exhausted response is ambiguous. Retry only if the provider
-      // explicitly says the limit should clear within the allowed short wait.
-      if (status === 429 && failureClass === 'quota_exhausted' && retryAfterMs === undefined) throw error;
+      if (status === 429 && retryAfterMs === undefined) throw error;
       // Respect a longer server rate-limit window by falling back instead of retrying too early.
       if (retryAfterMs !== undefined && retryAfterMs > maxDelayMs) throw error;
 
@@ -416,23 +416,30 @@ export async function retryGeminiRequest<T>(
   }
 }
 
-function getAIClient(): GoogleGenAI | null {
+export function createPlanAIClient(
+  apiKey: string,
+  fetcher: typeof fetch = fetch,
+  requestSignal?: AbortSignal
+): GoogleGenAI {
+  return new GoogleGenAI({
+    apiKey,
+    httpOptions: {
+      headers: { 'User-Agent': 'aistudio-build' },
+      fetch: createRetryAwareGeminiFetch(fetcher, requestSignal),
+      // The server retry wrapper below owns the bounded policy for plan generation.
+      retryOptions: { attempts: 1 },
+    },
+  });
+}
+
+function getAIClient(requestSignal?: AbortSignal): GoogleGenAI | null {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey || apiKey === 'MY_GEMINI_API_KEY' || apiKey.trim() === '') {
     return null;
   }
+  if (requestSignal) return createPlanAIClient(apiKey, fetch, requestSignal);
   if (!aiInstance) {
-    aiInstance = new GoogleGenAI({
-      apiKey,
-      httpOptions: {
-        headers: {
-          'User-Agent': 'aistudio-build',
-        },
-        fetch: createRetryAwareGeminiFetch(),
-        // The server retry wrapper below owns the bounded policy for plan generation.
-        retryOptions: { attempts: 1 },
-      },
-    });
+    aiInstance = createPlanAIClient(apiKey);
   }
   return aiInstance;
 }
@@ -538,7 +545,7 @@ export async function processPlanRequest(
   customFocus?: string,
   dependencies: PlanRequestDependencies = {}
 ): Promise<{ plan: AIPlanningResult; model: string }> {
-  const ai = getAIClient();
+  const ai = dependencies.generateContent ? null : getAIClient(dependencies.signal);
   const deterministicPlan = generateDeterministicPlan(event);
 
   if (!ai && !dependencies.generateContent) {
@@ -662,7 +669,10 @@ Use the supplied category allocations and amounts exactly; do not change their p
           responseMimeType: 'application/json',
         },
       })),
-      dependencies.retryOptions
+      {
+        ...dependencies.retryOptions,
+        signal: dependencies.signal ?? dependencies.retryOptions?.signal,
+      }
     );
 
     const rawText = response.text || '';
@@ -687,10 +697,12 @@ Use the supplied category allocations and amounts exactly; do not change their p
     };
   } catch (err) {
     const status = getErrorStatus(err);
-    console.warn(
-      'Gemini 3.8 Flash API call failed. Using deterministic engine fallback.',
-      status ? `HTTP ${status}` : 'request/network error'
-    );
+    if (!dependencies.signal?.aborted) {
+      console.warn(
+        'Gemini 3.8 Flash API call failed. Using deterministic engine fallback.',
+        status ? `HTTP ${status}` : 'request/network error'
+      );
+    }
     return {
       plan: {
         ...deterministicPlan,

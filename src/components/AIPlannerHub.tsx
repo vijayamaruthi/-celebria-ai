@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useState } from 'react';
+import React, { useRef, useState } from 'react';
 import { useEventContext } from '../context/EventContext';
 import {
   generateCelebrationPlan,
@@ -26,11 +26,13 @@ import {
   Info,
 } from 'lucide-react';
 import { formatCurrency } from '../utils/deterministicPlanner';
+import { acquireInFlightGuard, releaseInFlightGuard } from '../utils/inFlightGuard';
 
 export const AIPlannerHub: React.FC = () => {
   const { activeEvent, activePlan, saveAIPlan, applyPlanToWorkspace } = useEventContext();
 
   const [isLoading, setIsLoading] = useState(false);
+  const planSubmission = useRef({ inFlight: false });
   const [activePlanTab, setActivePlanTab] = useState<
     'strategy' | 'budget' | 'timeline' | 'vendors' | 'theme' | 'catering' | 'guests' | 'risks'
   >('strategy');
@@ -39,11 +41,13 @@ export const AIPlannerHub: React.FC = () => {
   // Custom creative ideas prompt state
   const [ideasPrompt, setIdeasPrompt] = useState('');
   const [ideasLoading, setIdeasLoading] = useState(false);
+  const ideasSubmission = useRef({ inFlight: false });
   const [customIdeas, setCustomIdeas] = useState<{ title: string; ideas: string[]; source: string } | null>(null);
 
   if (!activeEvent) return null;
 
   const handleGeneratePlan = async (forceDeterministic: boolean = false) => {
+    if (!acquireInFlightGuard(planSubmission.current)) return;
     setIsLoading(true);
     setStatusMessage('');
     try {
@@ -57,6 +61,7 @@ export const AIPlannerHub: React.FC = () => {
     } catch {
       setStatusMessage('Unable to complete request. Please try again.');
     } finally {
+      releaseInFlightGuard(planSubmission.current);
       setIsLoading(false);
     }
   };
@@ -76,6 +81,7 @@ export const AIPlannerHub: React.FC = () => {
   const handleAskCreativeIdeas = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!ideasPrompt.trim()) return;
+    if (!acquireInFlightGuard(ideasSubmission.current)) return;
 
     setIdeasLoading(true);
     try {
@@ -84,6 +90,7 @@ export const AIPlannerHub: React.FC = () => {
     } catch {
       // Handled in service fallback
     } finally {
+      releaseInFlightGuard(ideasSubmission.current);
       setIdeasLoading(false);
     }
   };

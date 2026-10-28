@@ -8,6 +8,7 @@ import { BUDGET_CATEGORIES } from '../types/index';
 import {
   createRetryAwareGeminiFetch,
   createIdeasAIClient,
+  createPlanAIClient,
   classifyGeminiFailure,
   processPlanRequest,
   retryGeminiRequest,
@@ -157,7 +158,11 @@ export function testGeminiBackend() {
                 metadata: { quota_metric: 'generate_content_requests_per_minute' },
               }],
             },
-          }), { status: 429, headers: { 'content-type': 'application/json' } });
+          }), { status: 429, headers: {
+            'content-type': 'application/json',
+            'retry-after': '',
+            'retry-after-ms': ' ',
+          } });
         }
         return new Response('ok', { status: 200 });
       });
@@ -341,6 +346,39 @@ export function testGeminiBackend() {
       }
 
       assert(fetchAttempts === 1, `Expected no early retry, got ${fetchAttempts} fetches`);
+    },
+  });
+
+  tests.push({
+    name: 'Fails fast on an unknown HTTP 429 without a usable retry hint',
+    run: async () => {
+      let fetchAttempts = 0;
+      const delays: number[] = [];
+      const retryAwareFetch = createRetryAwareGeminiFetch(async () => {
+        fetchAttempts++;
+        return new Response(JSON.stringify({
+          error: {
+            code: 429,
+            status: 'RESOURCE_EXHAUSTED',
+            message: 'Resource has been exhausted. Please check quota. PRIVATE_PROVIDER_DETAIL',
+          },
+        }), { status: 429, headers: { 'content-type': 'application/json' } });
+      });
+
+      try {
+        await retryGeminiRequest(() => retryAwareFetch('https://generativelanguage.googleapis.com/test'), {
+          maxAttempts: 3,
+          wait: async (delayMs) => { delays.push(delayMs); },
+        });
+        throw new Error('Expected an unhinted 429 to fail fast');
+      } catch (error) {
+        assert(!(error instanceof Error && error.message === 'Expected an unhinted 429 to fail fast'), 'Expected the original sanitized error');
+        assert(classifyGeminiFailure(error) === 'unknown_429', 'Expected unknown 429 classification');
+        assert(error instanceof Error && !error.message.includes('PRIVATE_PROVIDER_DETAIL'), 'Raw provider details must not be retained');
+      }
+
+      assert(fetchAttempts === 1, `Expected one request for an unhinted 429, got ${fetchAttempts}`);
+      assert(delays.length === 0, 'Expected no retry wait for an unhinted 429');
     },
   });
 
@@ -745,6 +783,73 @@ export function testGeminiBackend() {
 
       assert(attempts === 1, `Expected no retry after cancellation during backoff, got ${attempts}`);
       assert(Date.now() - startedAt < 300, 'Expected cancellation to interrupt the 500ms retry delay');
+    },
+  });
+
+  tests.push({
+    name: 'Stops Planning Assistant retries when the browser request is cancelled',
+    run: async () => {
+      const requestController = new AbortController();
+      let attempts = 0;
+      const result = await processPlanRequest(makeEvent(25001), undefined, {
+        signal: requestController.signal,
+        generateContent: async () => {
+          attempts++;
+          requestController.abort();
+          throw Object.assign(new Error('client disconnected'), { status: 503 });
+        },
+        retryOptions: { wait: async () => undefined },
+      });
+
+      assert(attempts === 1, `Expected cancellation to stop plan retries after one request, got ${attempts}`);
+      assert(result.plan.isFallback, 'Expected the deterministic fallback result after cancellation');
+    },
+  });
+
+  tests.push({
+    name: 'Aborts the installed-SDK Planning Assistant fetch when the browser disconnects',
+    run: async () => {
+      const callerController = new AbortController();
+      let fetchAttempts = 0;
+      let fetchSignal: AbortSignal | undefined;
+      let markFetchStarted!: () => void;
+      const fetchStarted = new Promise<void>((resolve) => { markFetchStarted = resolve; });
+      const client = createPlanAIClient('test-only-key', async (_input, init) => {
+        fetchAttempts++;
+        fetchSignal = init?.signal ?? undefined;
+        markFetchStarted();
+        return new Promise<Response>((_resolve, reject) => {
+          if (!fetchSignal) {
+            reject(new Error('Expected the SDK to pass a combined abort signal to fetch'));
+            return;
+          }
+          const rejectOnAbort = () => reject(Object.assign(new Error('mock fetch aborted'), { name: 'AbortError' }));
+          if (fetchSignal.aborted) rejectOnAbort();
+          else fetchSignal.addEventListener('abort', rejectOnAbort, { once: true });
+        });
+      }, callerController.signal);
+      const generation = client.models.generateContent({ model: 'gemini-3.8-flash', contents: 'disconnect test' })
+        .then(() => false, () => true);
+
+      let startGuard: ReturnType<typeof setTimeout> | undefined;
+      const didStart = await Promise.race([
+        fetchStarted.then(() => true),
+        new Promise<boolean>((resolve) => { startGuard = setTimeout(() => resolve(false), 250); }),
+      ]);
+      if (startGuard) clearTimeout(startGuard);
+      assert(didStart, 'Expected the Plan SDK to invoke the mocked fetch');
+
+      callerController.abort();
+      let abortGuard: ReturnType<typeof setTimeout> | undefined;
+      const didAbort = await Promise.race([
+        generation,
+        new Promise<boolean>((resolve) => { abortGuard = setTimeout(() => resolve(false), 250); }),
+      ]);
+      if (abortGuard) clearTimeout(abortGuard);
+
+      assert(didAbort, 'Expected the plan generation to reject when the browser disconnects');
+      assert(fetchAttempts === 1, `Expected cancellation to prevent duplicate plan SDK calls, got ${fetchAttempts}`);
+      assert(fetchSignal?.aborted === true, 'Expected the browser cancellation to abort the plan fetch signal');
     },
   });
 

@@ -46,6 +46,14 @@ function celebriaApiPlugin(): Plugin {
         }
 
         if (req.url === '/api/plan' && req.method === 'POST') {
+          const requestController = new AbortController();
+          const abortIfDisconnected = () => {
+            if (!res.writableEnded) requestController.abort();
+          };
+          req.once('aborted', abortIfDisconnected);
+          res.once('close', abortIfDisconnected);
+          if (req.aborted) requestController.abort();
+
           let body = '';
           req.on('data', (chunk) => {
             body += chunk;
@@ -54,10 +62,12 @@ function celebriaApiPlugin(): Plugin {
             try {
               const { event, customFocus } = JSON.parse(body);
               const { processPlanRequest } = await import('./src/server/geminiBackend.ts');
-              const result = await processPlanRequest(event, customFocus);
+              const result = await processPlanRequest(event, customFocus, { signal: requestController.signal });
+              if (res.destroyed) return;
               res.setHeader('Content-Type', 'application/json');
               res.end(JSON.stringify(result));
             } catch {
+              if (res.destroyed || requestController.signal.aborted) return;
               res.statusCode = 500;
               res.setHeader('Content-Type', 'application/json');
               res.end(
@@ -66,6 +76,9 @@ function celebriaApiPlugin(): Plugin {
                   details: 'Unexpected server error',
                 })
               );
+            } finally {
+              req.off('aborted', abortIfDisconnected);
+              res.off('close', abortIfDisconnected);
             }
           });
           return;
