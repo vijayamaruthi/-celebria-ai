@@ -83,13 +83,12 @@ function celebriaApiPlugin(): Plugin {
               const result = await processIdeasRequest(event, prompt);
               res.setHeader('Content-Type', 'application/json');
               res.end(JSON.stringify(result));
-            } catch (err: unknown) {
+            } catch {
               res.statusCode = 500;
               res.setHeader('Content-Type', 'application/json');
               res.end(
                 JSON.stringify({
                   error: 'Internal server error processing ideas',
-                  details: err instanceof Error ? err.message : 'Unknown error',
                 })
               );
             }

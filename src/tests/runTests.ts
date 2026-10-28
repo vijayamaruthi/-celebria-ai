@@ -10,6 +10,7 @@ import { testVendorPipeline } from './vendor.test';
 import { testAIPlanner } from './aiPlanner.test';
 import { testStoragePersistence } from './storage.test';
 import { testGeminiBackend } from './geminiBackend.test';
+import { testFocusedIdeas } from './focusedIdeas.test';
 
 console.log('====================================================');
 console.log(' Celebria AI Automated Verification & Test Suite');
@@ -27,6 +28,7 @@ const suites: { suiteName: string; tests: TestDef[] }[] = [
   { suiteName: 'Vendor Pipeline & Quote Reconciliation', tests: testVendorPipeline() },
   { suiteName: 'GenAI Strategy & Contextual Adaptation', tests: testAIPlanner() },
   { suiteName: 'Gemini Retries, Fallback & Budget Accuracy', tests: testGeminiBackend() },
+  { suiteName: 'Interactive Idea Generator Reliability & Fallback', tests: testFocusedIdeas() },
   { suiteName: 'State Persistence & JSON Backup Integrity', tests: testStoragePersistence() },
 ];
 

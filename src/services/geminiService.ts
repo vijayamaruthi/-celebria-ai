@@ -5,6 +5,7 @@
 
 import { CelebrationEvent, AIPlanningResult } from '../types';
 import { generateDeterministicPlan } from '../utils/deterministicPlanner';
+import { generateFocusedIdeasFallback } from '../utils/focusedIdeasFallback';
 
 export interface PlanGenerationOptions {
   customFocus?: string;
@@ -83,6 +84,8 @@ export async function generateFocusedIdeas(
   event: CelebrationEvent,
   prompt: string
 ): Promise<{ title: string; ideas: string[]; source: string }> {
+  const fallback = () => generateFocusedIdeasFallback(event, prompt);
+
   try {
     const response = await fetch('/api/ideas', {
       method: 'POST',
@@ -90,30 +93,28 @@ export async function generateFocusedIdeas(
       body: JSON.stringify({ event, prompt }),
     });
 
-    if (response.ok) {
-      const data = await response.json();
-      if (data && data.ideas) {
-        return {
-          title: data.title || 'Personalized Ideas',
-          ideas: data.ideas,
-          source: data.model || 'Gemini 3.8 Flash',
-        };
-      }
+    if (!response.ok) return fallback();
+
+    const data: unknown = await response.json();
+    if (
+      data &&
+      typeof data === 'object' &&
+      'title' in data &&
+      typeof data.title === 'string' &&
+      data.title.trim().length > 0 &&
+      'ideas' in data &&
+      Array.isArray(data.ideas) &&
+      data.ideas.length === 3 &&
+      data.ideas.every((idea: unknown) => typeof idea === 'string' && idea.trim().length > 0) &&
+      'model' in data &&
+      typeof data.model === 'string' &&
+      data.model.trim().length > 0
+    ) {
+      return { title: data.title, ideas: data.ideas, source: data.model };
     }
   } catch {
-    // Ignore and proceed to fallback
+    // Use the same contextual fallback if the API is unreachable or returns invalid JSON.
   }
 
-  // Heuristic ideas fallback
-  return {
-    title: `Tailored Ideas for ${event.name}`,
-    ideas: [
-      `Align food and beverage around interactive stations rather than standard lines for ${event.guestCount} guests.`,
-      `Incorporate warm ambient string lighting and acoustic live interludes to elevate the atmosphere.`,
-      `Design a zero-waste favors station where guests assemble custom botanical tea blends or take home potted succulents.`,
-      `Establish dedicated photo-ready welcome signs with the signature ${event.theme || 'celebration'} motif.`,
-      `Ensure dedicated wheelchair ramps and a designated sensory recharge area are clearly marked on printed programs.`,
-    ],
-    source: 'Celebria Heuristic Engine (Local Fallback)',
-  };
+  return fallback();
 }

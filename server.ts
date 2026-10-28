@@ -77,11 +77,11 @@ app.post('/api/ideas', async (req: Request, res: Response) => {
 
     const result = await processIdeasRequest(event, prompt);
     res.json(result);
-  } catch (error: unknown) {
-    console.error('Error handling /api/ideas:', error);
+  } catch {
+    // Avoid logging raw request/provider errors, which may contain user content or credentials.
+    console.error('Failed to process /api/ideas request.');
     res.status(500).json({
       error: 'Failed to generate ideas',
-      details: error instanceof Error ? error.message : 'Unknown error',
     });
   }
 });

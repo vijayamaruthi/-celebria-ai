@@ -6,8 +6,10 @@
 import { GoogleGenAI } from '@google/genai';
 import type { CelebrationEvent, AIPlanningResult } from '../types/index.ts';
 import { generateDeterministicPlan } from '../utils/deterministicPlanner.ts';
+import { generateFocusedIdeasFallback } from '../utils/focusedIdeasFallback.ts';
 
 let aiInstance: GoogleGenAI | null = null;
+let ideasAiInstance: GoogleGenAI | null = null;
 
 type GeminiContentResponse = { text?: string | null };
 
@@ -15,6 +17,12 @@ export interface GeminiRetryOptions {
   maxAttempts?: number;
   initialDelayMs?: number;
   maxDelayMs?: number;
+  /** Symmetric random jitter fraction applied to exponential delays (0 disables jitter). */
+  jitter?: number;
+  random?: () => number;
+  /** Opt into broader fetch/abort error matching for the Ideas endpoint only. */
+  retryAbortErrors?: boolean;
+  retryFailedFetchErrors?: boolean;
   wait?: (delayMs: number) => Promise<void>;
 }
 
@@ -23,7 +31,15 @@ export interface PlanRequestDependencies {
   retryOptions?: GeminiRetryOptions;
 }
 
-const DEFAULT_RETRY_OPTIONS: Required<Omit<GeminiRetryOptions, 'wait'>> = {
+export interface IdeasRequestDependencies {
+  generateContent?: (prompt: string) => Promise<GeminiContentResponse>;
+  retryOptions?: GeminiRetryOptions;
+}
+
+const DEFAULT_RETRY_OPTIONS: Required<Omit<
+  GeminiRetryOptions,
+  'wait' | 'jitter' | 'random' | 'retryAbortErrors' | 'retryFailedFetchErrors'
+>> = {
   maxAttempts: 3,
   initialDelayMs: 500,
   maxDelayMs: 5000,
@@ -110,17 +126,24 @@ function getRetryAfterMs(error: unknown): number | undefined {
   return Number.isNaN(date) ? undefined : Math.max(0, date - Date.now());
 }
 
-function isTransientNetworkError(error: unknown): boolean {
+function isTransientNetworkError(
+  error: unknown,
+  retryAbortErrors = false,
+  retryFailedFetchErrors = false
+): boolean {
   let current = error;
 
   for (let depth = 0; depth < 4 && current && typeof current === 'object'; depth++) {
     const value = current as { code?: unknown; name?: unknown; message?: unknown; cause?: unknown };
     if (typeof value.code === 'string' && TRANSIENT_NETWORK_CODES.has(value.code)) return true;
-    if (value.name === 'TimeoutError') return true;
+    if (value.name === 'TimeoutError' || (retryAbortErrors && value.name === 'AbortError')) return true;
     if (
       value.name === 'TypeError' &&
       typeof value.message === 'string' &&
-      /^(fetch failed|network error|network request failed)$/i.test(value.message.trim())
+      (
+        /^(fetch failed|network error|network request failed)$/i.test(value.message.trim()) ||
+        (retryFailedFetchErrors && /^failed to fetch$/i.test(value.message.trim()))
+      )
     ) {
       return true;
     }
@@ -164,6 +187,11 @@ export async function retryGeminiRequest<T>(
   const initialDelayMs = Number.isFinite(requestedInitialDelayMs)
     ? Math.min(maxDelayMs, Math.max(0, requestedInitialDelayMs))
     : Math.min(maxDelayMs, DEFAULT_RETRY_OPTIONS.initialDelayMs);
+  const requestedJitter = options.jitter ?? 0;
+  const jitter = Number.isFinite(requestedJitter)
+    ? Math.min(1, Math.max(0, requestedJitter))
+    : 0;
+  const random = options.random ?? Math.random;
   const wait = options.wait ?? waitForRetry;
 
   for (let attempt = 1; ; attempt++) {
@@ -175,7 +203,11 @@ export async function retryGeminiRequest<T>(
       // never get retried just because an attached cause happens to look transient.
       const isTemporary = status !== undefined
         ? [408, 429, 500, 502, 503, 504].includes(status)
-        : isTransientNetworkError(error);
+        : isTransientNetworkError(
+            error,
+            options.retryAbortErrors === true,
+            options.retryFailedFetchErrors === true
+          );
       if (!isTemporary || attempt >= maxAttempts) throw error;
 
       const retryAfterMs = status === 429 ? getRetryAfterMs(error) : undefined;
@@ -183,7 +215,15 @@ export async function retryGeminiRequest<T>(
       if (retryAfterMs !== undefined && retryAfterMs > maxDelayMs) throw error;
 
       const exponentialDelayMs = Math.min(maxDelayMs, initialDelayMs * 2 ** (attempt - 1));
-      await wait(Math.max(exponentialDelayMs, retryAfterMs ?? 0));
+      const randomValue = random();
+      const safeRandomValue = Number.isFinite(randomValue)
+        ? Math.min(1, Math.max(0, randomValue))
+        : 0.5;
+      const jitteredDelayMs = Math.min(
+        maxDelayMs,
+        Math.max(0, exponentialDelayMs * (1 + ((safeRandomValue * 2) - 1) * jitter))
+      );
+      await wait(Math.max(jitteredDelayMs, retryAfterMs ?? 0));
     }
   }
 }
@@ -207,6 +247,24 @@ function getAIClient(): GoogleGenAI | null {
     });
   }
   return aiInstance;
+}
+
+function getIdeasAIClient(): GoogleGenAI | null {
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey || apiKey === 'MY_GEMINI_API_KEY' || apiKey.trim() === '') return null;
+  if (!ideasAiInstance) {
+    ideasAiInstance = new GoogleGenAI({
+      apiKey,
+      httpOptions: {
+        headers: { 'User-Agent': 'aistudio-build' },
+        fetch: createRetryAwareGeminiFetch(),
+        // Give each outer retry a finite lifetime; retryGeminiRequest owns the total attempt budget.
+        timeout: 15000,
+        retryOptions: { attempts: 1 },
+      },
+    });
+  }
+  return ideasAiInstance;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -443,20 +501,16 @@ Use the supplied category allocations and amounts exactly; do not change their p
 }
 export async function processIdeasRequest(
   event: CelebrationEvent,
-  userPrompt: string
+  userPrompt: string,
+  dependencies: IdeasRequestDependencies = {}
 ): Promise<{ title: string; ideas: string[]; model: string }> {
-  const ai = getAIClient();
+  const ai = dependencies.generateContent ? null : getIdeasAIClient();
+  const useFallback = () => {
+    const fallback = generateFocusedIdeasFallback(event, userPrompt);
+    return { title: fallback.title, ideas: fallback.ideas, model: fallback.source };
+  };
 
-  if (!ai) {
-    console.error('Gemini unavailable: GEMINI_API_KEY is missing or invalid.');
-    return {
-      title: `AI unavailable — ${event.name}`,
-      ideas: [
-        'Gemini is not configured. Check the GEMINI_API_KEY environment variable in Render.',
-      ],
-      model: 'AI Unavailable',
-    };
-  }
+  if (!ai && !dependencies.generateContent) return useFallback();
 
   try {
     const prompt = `
@@ -465,9 +519,16 @@ Answer the user's actual request and never substitute a different event.
 
 EVENT: ${event.name}
 TYPE: ${event.type}
+DATE: ${event.date}${event.time ? ` at ${event.time}` : ''}
 GUESTS: ${event.guestCount}
 BUDGET: ${event.totalBudget} ${event.currency}
+LOCATION: ${event.location}
+VENUE TYPE: ${event.venueType}
 THEME: ${event.theme || 'Not specified'}
+PRIORITIES: ${event.priorities?.join(', ') || 'Not specified'}
+DIETARY REQUIREMENTS: ${event.dietaryRequirements?.join(', ') || 'Not specified'}
+ACCESSIBILITY NEEDS: ${event.accessibilityNeeds?.join(', ') || 'Not specified'}
+SPECIAL NOTES: ${event.notes || 'None'}
 
 USER REQUEST:
 ${userPrompt}
@@ -482,11 +543,21 @@ Give exactly 3 practical, specific ideas. Respect the event type and budget.
 Do not provide wedding suggestions unless the user asks about a wedding.
 `;
 
-    const response = await ai.models.generateContent({
-      model: 'gemini-3.8-flash',
-      contents: prompt,
-      config: { responseMimeType: 'application/json' },
-    });
+    const response = await retryGeminiRequest(
+      dependencies.generateContent
+        ? () => dependencies.generateContent!(prompt)
+        : () => ai!.models.generateContent({
+            model: 'gemini-3.8-flash',
+            contents: prompt,
+            config: { responseMimeType: 'application/json' },
+          }),
+      {
+        jitter: 0.2,
+        retryAbortErrors: true,
+        retryFailedFetchErrors: true,
+        ...dependencies.retryOptions,
+      }
+    );
 
     const rawText = (response.text || '')
       .replace(/^```json\s*/, '')
@@ -495,20 +566,16 @@ Do not provide wedding suggestions unless the user asks about a wedding.
 
     const parsed = JSON.parse(rawText);
 
-    if (
-      typeof parsed.title !== 'string' ||
-      !Array.isArray(parsed.ideas) ||
-      parsed.ideas.length === 0
-    ) {
+    if (typeof parsed.title !== 'string' || !Array.isArray(parsed.ideas)) {
       throw new Error('Gemini returned an invalid ideas response.');
     }
 
     const ideas = parsed.ideas
-      .filter((idea: unknown): idea is string => typeof idea === 'string')
+      .filter((idea: unknown): idea is string => typeof idea === 'string' && idea.trim().length > 0)
       .slice(0, 3);
 
-    if (ideas.length === 0) {
-      throw new Error('Gemini returned no valid ideas.');
+    if (parsed.title.trim().length === 0 || ideas.length !== 3) {
+      throw new Error('Gemini returned an incomplete ideas response.');
     }
 
     return {
@@ -517,14 +584,12 @@ Do not provide wedding suggestions unless the user asks about a wedding.
       model: 'Gemini 3.8 Flash',
     };
   } catch (err) {
-    console.error('Gemini idea generation failed:', err);
-    return {
-      title: `AI temporarily unavailable — ${event.name}`,
-      ideas: [
-        'The Gemini request failed. Check the Render application logs for details.',
-        'Verify that the API key is valid and Gemini 3.8 Flash is accessible.',
-      ],
-      model: 'AI Unavailable',
-    };
+    // Keep prompts, event notes, API key material, and raw provider errors out of logs.
+    const status = getErrorStatus(err);
+    console.warn(
+      'Gemini idea generation failed; using contextual fallback.',
+      status ? `HTTP ${status}` : 'request/network error'
+    );
+    return useFallback();
   }
 }
