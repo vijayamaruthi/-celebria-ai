@@ -6,6 +6,10 @@
 import type { CelebrationEvent } from '../types/index';
 import { generateFocusedIdeas } from '../services/geminiService';
 import { processIdeasRequest, retryGeminiRequest } from '../server/geminiBackend';
+import { resolveFocusedIdeasEventContext } from '../utils/focusedIdeasFallback';
+
+const BANGALORE_WEDDING_QUESTION =
+  'Suggest creative, budget-friendly entertainment ideas for a wedding in Bangalore with 200 guests and a total budget of ₹30,00,000. Include interactive games, guest activities, and practical recommendations.';
 
 function makeEvent(): CelebrationEvent {
   return {
@@ -26,6 +30,18 @@ function makeEvent(): CelebrationEvent {
     notes: 'Keep the activity area close to seating.',
     createdAt: '',
     updatedAt: '',
+  };
+}
+
+function makeStaleWorkspaceEvent(): CelebrationEvent {
+  return {
+    ...makeEvent(),
+    name: 'weeding',
+    type: 'birthday',
+    guestCount: 80,
+    totalBudget: 15000,
+    currency: 'USD',
+    location: 'Seattle',
   };
 }
 
@@ -75,6 +91,49 @@ export function testFocusedIdeas() {
   });
 
   tests.push({
+    name: 'Uses explicit question details instead of stale workspace facts in the Gemini request',
+    run: async () => {
+      let submittedPrompt = '';
+      const result = await processIdeasRequest(makeStaleWorkspaceEvent(), BANGALORE_WEDDING_QUESTION, {
+        generateContent: async (prompt) => {
+          submittedPrompt = prompt;
+          return responseText('Wedding entertainment ideas');
+        },
+        retryOptions: { wait: async () => undefined },
+      });
+
+      assert(result.model === 'Gemini 3.8 Flash', 'Expected Gemini source labeling to remain intact');
+      for (const detail of ['TYPE: wedding', 'GUESTS: 200', 'BUDGET: 3000000 INR', 'LOCATION: Bangalore']) {
+        assert(submittedPrompt.includes(detail), `Expected Gemini prompt to use ${detail}`);
+      }
+      assert(!submittedPrompt.includes('GUESTS: 80'), 'Stale guest count must not reach Gemini');
+      assert(!submittedPrompt.includes('15000 USD'), 'Stale USD budget must not reach Gemini');
+      assert(!submittedPrompt.includes('Seattle'), 'Stale location must not reach Gemini');
+      assert(!submittedPrompt.includes('weeding'), 'Misspelled stale workspace name must not reach Gemini');
+      assert(!submittedPrompt.includes('2027-08-14'), 'Unrelated workspace date must not reach Gemini');
+      assert(!submittedPrompt.includes('Starlit garden'), 'Unrelated workspace theme must not reach Gemini');
+      assert(!submittedPrompt.includes('vegan, gluten-free'), 'Unrelated workspace dietary notes must not reach Gemini');
+      assert(submittedPrompt.includes(BANGALORE_WEDDING_QUESTION), 'Expected the original question to be preserved');
+    },
+  });
+
+  tests.push({
+    name: 'Retains workspace details that the current question does not contradict',
+    run: async () => {
+      const event = makeEvent();
+      const resolved = resolveFocusedIdeasEventContext(
+        event,
+        'Suggest budget-friendly entertainment and games for a birthday.'
+      );
+      assert(resolved.type === event.type, 'Expected the workspace event type to remain supplemental context');
+      assert(resolved.location === event.location, 'Expected the workspace location to remain when unstated');
+      assert(resolved.guestCount === event.guestCount, 'Expected the workspace guest count to remain when unstated');
+      assert(resolved.totalBudget === event.totalBudget, 'Expected the workspace budget to remain when unstated');
+      assert(resolved.currency === event.currency, 'Expected the workspace currency to remain when unstated');
+    },
+  });
+
+  tests.push({
     name: 'Retries a transient 503 with bounded jitter and then returns Gemini ideas',
     run: async () => {
       let attempts = 0;
@@ -102,32 +161,51 @@ export function testFocusedIdeas() {
   });
 
   tests.push({
-    name: 'Returns contextual ideas after three 503 failures without logging provider details',
+    name: 'Returns entertainment-focused ideas with current question context after repeated 503 errors',
     run: async () => {
-      const event = makeEvent();
-      const question = 'How can we make the karaoke area accessible?';
+      const event = makeStaleWorkspaceEvent();
       let attempts = 0;
       let warning = '';
       const originalWarn = console.warn;
       console.warn = (...args: unknown[]) => { warning = args.map(String).join(' '); };
       try {
-        const result = await processIdeasRequest(event, question, {
+        const result = await processIdeasRequest(event, BANGALORE_WEDDING_QUESTION, {
           generateContent: async () => {
             attempts++;
-            throw Object.assign(new Error(`503 response included private prompt ${question}`), { status: 503 });
+            throw Object.assign(new Error(`503 response included private prompt ${BANGALORE_WEDDING_QUESTION}`), { status: 503 });
           },
           retryOptions: { initialDelayMs: 10, maxDelayMs: 100, wait: async () => undefined },
         });
 
         assert(attempts === 3, `Expected the three-attempt ceiling, got ${attempts}`);
         assert(result.model === 'Celebria Heuristic Engine (Contextual Fallback)', 'Expected fallback source labeling');
-        assert(result.ideas.length === 3, 'Expected three useful fallback ideas');
+        assert(result.ideas.length === 6, 'Expected the complete entertainment fallback plan');
         const joinedIdeas = result.ideas.join(' ');
-        for (const context of [question, 'birthday', 'Mira’s Birthday', 'Auckland', 'NZ$6,000']) {
+        for (const context of [
+          BANGALORE_WEDDING_QUESTION,
+          'wedding',
+          'Bangalore',
+          '200 guests',
+          '₹30,00,000',
+          'trivia',
+          'wedding bingo',
+          'photo spot',
+          'message station',
+          'Kannada',
+          'run of show',
+          'low-cost',
+        ]) {
           assert(joinedIdeas.includes(context), `Expected fallback ideas to preserve ${context}`);
         }
+        assert(!joinedIdeas.includes('80 guests'), 'Stale guest count must not appear in fallback');
+        assert(!joinedIdeas.includes('$15,000'), 'Stale budget and currency must not appear in fallback');
+        assert(!joinedIdeas.includes('Seattle'), 'Stale workspace location must not appear in fallback');
+        assert(!joinedIdeas.includes('weeding'), 'Misspelled stale event name must not appear in fallback');
+        assert(!joinedIdeas.includes('2027-08-14'), 'Unrelated workspace date must not appear in fallback');
+        assert(!joinedIdeas.includes('Starlit garden'), 'Unrelated workspace theme must not appear in fallback');
+        assert(!joinedIdeas.includes('vegan'), 'Unrelated workspace dietary notes must not appear in fallback');
         assert(warning.includes('HTTP 503'), 'Expected only the safe provider status in the warning');
-        assert(!warning.includes(question), 'Expected private request text to stay out of logs');
+        assert(!warning.includes(BANGALORE_WEDDING_QUESTION), 'Expected private request text to stay out of logs');
       } finally {
         console.warn = originalWarn;
       }
@@ -250,14 +328,14 @@ export function testFocusedIdeas() {
       const source = 'Celebria Heuristic Engine (Contextual Fallback)';
       globalThis.fetch = async () => new Response(JSON.stringify({
         title: 'Practical ideas for Mira’s Birthday',
-        ideas: ['Idea one', 'Idea two', 'Idea three'],
+        ideas: ['Idea one', 'Idea two', 'Idea three', 'Idea four', 'Idea five', 'Idea six'],
         model: source,
       }), { status: 200, headers: { 'Content-Type': 'application/json' } });
 
       try {
         const result = await generateFocusedIdeas(makeEvent(), 'Suggest birthday decor');
         assert(result.source === source, 'Expected fallback origin to be visible to the existing Source label');
-        assert(result.ideas.length === 3, 'Expected all valid server ideas to reach the UI');
+        assert(result.ideas.length === 6, 'Expected the complete server fallback to reach the UI');
       } finally {
         globalThis.fetch = originalFetch;
       }

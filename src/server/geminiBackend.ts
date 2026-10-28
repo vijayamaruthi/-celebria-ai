@@ -6,7 +6,10 @@
 import { GoogleGenAI } from '@google/genai';
 import type { CelebrationEvent, AIPlanningResult } from '../types/index.ts';
 import { generateDeterministicPlan } from '../utils/deterministicPlanner.ts';
-import { generateFocusedIdeasFallback } from '../utils/focusedIdeasFallback.ts';
+import {
+  generateFocusedIdeasFallback,
+  resolveFocusedIdeasEventContext,
+} from '../utils/focusedIdeasFallback.ts';
 
 let aiInstance: GoogleGenAI | null = null;
 let ideasAiInstance: GoogleGenAI | null = null;
@@ -505,6 +508,7 @@ export async function processIdeasRequest(
   dependencies: IdeasRequestDependencies = {}
 ): Promise<{ title: string; ideas: string[]; model: string }> {
   const ai = dependencies.generateContent ? null : getIdeasAIClient();
+  const requestEvent = resolveFocusedIdeasEventContext(event, userPrompt);
   const useFallback = () => {
     const fallback = generateFocusedIdeasFallback(event, userPrompt);
     return { title: fallback.title, ideas: fallback.ideas, model: fallback.source };
@@ -513,22 +517,24 @@ export async function processIdeasRequest(
   if (!ai && !dependencies.generateContent) return useFallback();
 
   try {
+    const workspaceContextRelevant = requestEvent.type === event.type;
     const prompt = `
 You are Celebria AI, a creative celebration planner.
 Answer the user's actual request and never substitute a different event.
+When the user request explicitly gives event details, those details take precedence over the supplemental workspace context below.
 
-EVENT: ${event.name}
-TYPE: ${event.type}
-DATE: ${event.date}${event.time ? ` at ${event.time}` : ''}
-GUESTS: ${event.guestCount}
-BUDGET: ${event.totalBudget} ${event.currency}
-LOCATION: ${event.location}
-VENUE TYPE: ${event.venueType}
-THEME: ${event.theme || 'Not specified'}
-PRIORITIES: ${event.priorities?.join(', ') || 'Not specified'}
-DIETARY REQUIREMENTS: ${event.dietaryRequirements?.join(', ') || 'Not specified'}
-ACCESSIBILITY NEEDS: ${event.accessibilityNeeds?.join(', ') || 'Not specified'}
-SPECIAL NOTES: ${event.notes || 'None'}
+EVENT: ${requestEvent.name}
+TYPE: ${requestEvent.type}
+DATE: ${requestEvent.date || 'Not stated in the current question'}${requestEvent.time ? ` at ${requestEvent.time}` : ''}
+GUESTS: ${requestEvent.guestCount > 0 ? requestEvent.guestCount : 'Not stated in the current question'}
+BUDGET: ${Number.isFinite(requestEvent.totalBudget) ? `${requestEvent.totalBudget} ${requestEvent.currency}`.trim() : 'Not stated in the current question'}
+LOCATION: ${requestEvent.location || 'Not stated in the current question'}
+VENUE TYPE: ${workspaceContextRelevant ? requestEvent.venueType : 'Not stated in the current question'}
+THEME: ${requestEvent.theme || 'Not stated in the current question'}
+PRIORITIES: ${requestEvent.priorities?.join(', ') || 'Not specified'}
+DIETARY REQUIREMENTS: ${requestEvent.dietaryRequirements?.join(', ') || 'Not specified'}
+ACCESSIBILITY NEEDS: ${requestEvent.accessibilityNeeds?.join(', ') || 'Not specified'}
+SPECIAL NOTES: ${requestEvent.notes || 'None'}
 
 USER REQUEST:
 ${userPrompt}

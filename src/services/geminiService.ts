@@ -104,7 +104,8 @@ export async function generateFocusedIdeas(
       data.title.trim().length > 0 &&
       'ideas' in data &&
       Array.isArray(data.ideas) &&
-      data.ideas.length === 3 &&
+      data.ideas.length >= 3 &&
+      data.ideas.length <= 6 &&
       data.ideas.every((idea: unknown) => typeof idea === 'string' && idea.trim().length > 0) &&
       'model' in data &&
       typeof data.model === 'string' &&
