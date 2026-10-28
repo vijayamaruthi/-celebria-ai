@@ -491,7 +491,11 @@ Use the supplied category allocations and amounts exactly; do not change their p
       model: 'Gemini 3.8 Flash',
     };
   } catch (err) {
-    console.warn('Gemini 3.8 Flash API call failed. Using deterministic engine fallback.', err);
+    const status = getErrorStatus(err);
+    console.warn(
+      'Gemini 3.8 Flash API call failed. Using deterministic engine fallback.',
+      status ? `HTTP ${status}` : 'request/network error'
+    );
     return {
       plan: {
         ...deterministicPlan,

@@ -10,6 +10,7 @@ import {
   processPlanRequest,
   retryGeminiRequest,
 } from '../server/geminiBackend';
+import { generateCelebrationPlan } from '../services/geminiService';
 import { generateDeterministicPlan } from '../utils/deterministicPlanner';
 
 function makeEvent(totalBudget: number): CelebrationEvent {
@@ -162,6 +163,59 @@ export function testGeminiBackend() {
       assert(result.plan.isFallback, 'Expected the deterministic fallback to be marked as fallback');
       assert(allocatedTotal === event.totalBudget, `Expected fallback allocations to total ${event.totalBudget}, got ${allocatedTotal}`);
       assertValidAllocations(event, result.plan.recommendedCategoryAllocations);
+    },
+  });
+
+  tests.push({
+    name: 'Does not log raw provider errors when the Planning Assistant falls back',
+    run: async () => {
+      const originalWarn = console.warn;
+      const warnings: string[] = [];
+      console.warn = (...args: unknown[]) => { warnings.push(args.map(String).join(' ')); };
+
+      try {
+        const result = await processPlanRequest(makeEvent(25001), undefined, {
+          generateContent: async () => {
+            throw Object.assign(new Error('private provider detail and request content'), { status: 503 });
+          },
+          retryOptions: { maxAttempts: 1 },
+        });
+
+        assert(result.plan.isFallback, 'Expected the deterministic fallback after a provider error');
+        const warningText = warnings.join('\n');
+        assert(warningText.includes('HTTP 503'), 'Expected the sanitized log to retain the HTTP status');
+        assert(!warningText.includes('private provider detail'), 'Raw provider details must not be logged');
+        assert(!warningText.includes('request content'), 'Request content must not be logged');
+      } finally {
+        console.warn = originalWarn;
+      }
+    },
+  });
+
+  tests.push({
+    name: 'Does not log raw API error bodies in the Planning Assistant client fallback',
+    run: async () => {
+      const originalFetch = globalThis.fetch;
+      const originalWarn = console.warn;
+      const warnings: string[] = [];
+      globalThis.fetch = async () => new Response(JSON.stringify({
+        error: 'Request failed',
+        details: 'private provider detail and request content',
+      }), { status: 500, headers: { 'content-type': 'application/json' } });
+      console.warn = (...args: unknown[]) => { warnings.push(args.map(String).join(' ')); };
+
+      try {
+        const result = await generateCelebrationPlan(makeEvent(25001));
+        const warningText = warnings.join('\n');
+
+        assert(result.isFallback === true, 'Expected the client to use its deterministic fallback');
+        assert(warningText.includes('HTTP 500'), 'Expected the client log to retain the HTTP status');
+        assert(!warningText.includes('private provider detail'), 'Raw API error details must not be logged');
+        assert(!warningText.includes('request content'), 'Request content must not be logged');
+      } finally {
+        globalThis.fetch = originalFetch;
+        console.warn = originalWarn;
+      }
     },
   });
 

@@ -43,8 +43,7 @@ export async function generateCelebrationPlan(
     clearTimeout(timeoutId);
 
     if (!response.ok) {
-      const errorData = await response.json().catch(() => ({}));
-      console.warn('Backend Gemini API returned non-OK status:', response.status, errorData);
+      console.warn('Backend AI plan request failed; using deterministic fallback.', `HTTP ${response.status}`);
       const fallback = generateDeterministicPlan(event);
       return {
         ...fallback,
@@ -66,8 +65,8 @@ export async function generateCelebrationPlan(
 
     // Fallback if data structure is unexpected
     return generateDeterministicPlan(event);
-  } catch (err: unknown) {
-    console.warn('Network or server error during AI plan generation. Using deterministic fallback.', err);
+  } catch {
+    console.warn('Network or server error during AI plan generation. Using deterministic fallback.');
     const fallback = generateDeterministicPlan(event);
     return {
       ...fallback,

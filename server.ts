@@ -57,11 +57,12 @@ app.post('/api/plan', async (req: Request, res: Response) => {
 
     const result = await processPlanRequest(event, customFocus);
     res.json(result);
-  } catch (error: unknown) {
-    console.error('Error handling /api/plan:', error);
+  } catch {
+    // Unexpected provider/request errors can contain sensitive details; keep them out of logs and responses.
+    console.error('Failed to process /api/plan request.');
     res.status(500).json({
       error: 'Failed to process AI planning request',
-      details: error instanceof Error ? error.message : 'Unknown error',
+      details: 'Unexpected server error',
     });
   }
 });
